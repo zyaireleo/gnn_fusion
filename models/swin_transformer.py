@@ -10,6 +10,7 @@ Backbone modules.
 import os
 from collections import OrderedDict
 import functools
+
 print = functools.partial(print, flush=True)
 import torch
 import torch.nn.functional as F
@@ -264,6 +265,7 @@ class PatchMerging(nn.Module):
         dim (int): Number of input channels.
         norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
     """
+
     def __init__(self, dim, norm_layer=nn.LayerNorm):
         super().__init__()
         self.dim = dim
@@ -573,6 +575,7 @@ class SwinTransformer(nn.Module):
             pretrained (str, optional): Path to pre-trained weights.
                 Defaults to None.
         """
+
         def _init_weights(m):
             if isinstance(m, nn.Linear):
                 trunc_normal_(m.weight, std=.02)
@@ -585,7 +588,7 @@ class SwinTransformer(nn.Module):
         if isinstance(pretrained, str):
             self.apply(_init_weights)
             checkpoint = torch.load(pretrained, map_location='cpu')
-            print(f'load from {pretrained}.') 
+            print(f'load from {pretrained}.')
             self.load_state_dict(checkpoint['model'], strict=False)
         elif pretrained is None:
             self.apply(_init_weights)
@@ -613,7 +616,7 @@ class SwinTransformer(nn.Module):
                 x_out = norm_layer(x_out)
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs.append(out)
-        rets = {str(u): v for (u,v) in enumerate(outs)}
+        rets = {str(u): v for (u, v) in enumerate(outs)}
         return rets
 
     def train(self, mode=True):
@@ -633,15 +636,16 @@ class BackboneBase(nn.Module):
         xs = self.body(tensor_list.tensors)
         out: Dict[str, NestedTensor] = {}
         for name, x in xs.items():
-            m = tensor_list.mask
-            assert m is not None
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+            mask = tensor_list.mask
+            if mask is not None:
+                mask = F.interpolate(mask[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
             out[name] = NestedTensor(x, mask)
         return out
 
 
 class Backbone(BackboneBase):
     """ResNet backbone with frozen BatchNorm."""
+
     def __init__(self, name: str,
                  checkpoint: bool = False,
                  pretrained: str = None):
@@ -649,8 +653,8 @@ class Backbone(BackboneBase):
         cfgs = configs[name]
         cfgs.update({'use_checkpoint': checkpoint})
         out_indices = cfgs['out_indices']
-        strides = [int(2**(i+2)) for i in out_indices]
-        num_channels = [int(cfgs['embed_dim'] * 2**i) for i in out_indices]
+        strides = [int(2 ** (i + 2)) for i in out_indices]
+        num_channels = [int(cfgs['embed_dim'] * 2 ** i) for i in out_indices]
         backbone = SwinTransformer(**cfgs)
         backbone.init_weights(pretrained)
         super().__init__(backbone, strides, num_channels)
@@ -664,7 +668,8 @@ class Joiner(nn.Sequential):
 
     def forward(self, tensor_list: NestedTensor):
         tensor_list.tensors = rearrange(tensor_list.tensors, 'b t c h w -> (b t) c h w')
-        tensor_list.mask = rearrange(tensor_list.mask, 'b t h w -> (b t) h w')
+        if tensor_list.mask is not None:
+            tensor_list.mask = rearrange(tensor_list.mask, 'b t h w -> (b t) h w')
 
         xs = self[0](tensor_list)
         out: List[NestedTensor] = []
@@ -676,13 +681,16 @@ class Joiner(nn.Sequential):
             pos.append(self[1](x).to(x.tensors.dtype))
         return out, pos
 
-    
+
 def build_swin_backbone(args):
     position_embedding = build_position_encoding(args)
-    backbone = Backbone(args.backbone, args.use_checkpoint, args.backbone_pretrained)
-    model = Joiner(backbone, position_embedding)
-    return model
- 
+    vision_backbone = Backbone(args.vision_backbone, args.use_checkpoint, args.backbone_pretrained)
+    vision_backbone = Joiner(vision_backbone, position_embedding)
+    position_embedding = build_position_encoding(args)
+    depth_backbone = Backbone(args.vision_backbone, args.use_checkpoint, args.backbone_pretrained)
+    depth_backbone = Joiner(depth_backbone, position_embedding)
+    return vision_backbone, depth_backbone
+
 
 configs = {
     'swin_t_p4w7': dict(embed_dim=96,
