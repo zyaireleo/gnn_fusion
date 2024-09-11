@@ -5,33 +5,34 @@ Modified from DETR (https://github.com/facebookresearch/detr)
 import argparse
 import datetime
 import json
+import os
 import random
 import time
 from pathlib import Path
 
+import GPUtil
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data import DataLoader
 
-import util.misc as utils
 import datasets.samplers as samplers
-from datasets import build_dataset, get_coco_api_from_dataset
-from engine import train_one_epoch, evaluate, evaluate_a2d
-from models import build_model
-
-from tools.load_pretrained_weights import pre_trained_model_to_finetune
-
 import opts
-
+import util.misc as utils
+from datasets import build_dataset
+from engine import train_one_epoch, evaluate_a2d
+from models import build_model
+from tools.load_pretrained_weights import pre_trained_model_to_finetune
 
 
 def main(args):
     args.masks = True
 
     utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
+    # print("git:\n  {}\n".format(utils.get_sha()))
     print(args)
-    
+
     print(f'\n Run on {args.dataset_file} dataset.')
     print('\n')
 
@@ -48,7 +49,8 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
     # for n, p in model_without_ddp.named_parameters():
@@ -65,25 +67,28 @@ def main(args):
                 break
         return out
 
-
     param_dicts = [
         {
             "params":
                 [p for n, p in model_without_ddp.named_parameters()
-                 if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n, args.lr_text_encoder_names) 
+                 if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n,
+                                                                                                   args.lr_text_encoder_names)
                  and not match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
             "lr": args.lr,
         },
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if
+                       match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
             "lr": args.lr_backbone,
         },
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_text_encoder_names) and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if
+                       match_name_keywords(n, args.lr_text_encoder_names) and p.requires_grad],
             "lr": args.lr_text_encoder,
         },
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if
+                       match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
             "lr": args.lr * args.lr_linear_proj_mult,
         }
     ]
@@ -127,7 +132,7 @@ def main(args):
         assert args.pretrained_weights is not None, "Please provide the pretrained weight to finetune for Ref-DAVIS17"
         print("============================================>")
         print("Ref-DAVIS17 are finetuned using the checkpoint trained on Ref-Youtube-VOS")
-        print("Load checkpoint weights from {} ...".format(args.pretrained_weights))
+        print(f"Load checkpoint weights from {args.pretrained_weights} ...")
         checkpoint = torch.load(args.pretrained_weights, map_location="cpu")
         checkpoint_dict = pre_trained_model_to_finetune(checkpoint, args)
         model_without_ddp.load_state_dict(checkpoint_dict, strict=False)
@@ -137,34 +142,32 @@ def main(args):
         assert args.resume is not None, "Please provide the checkpoint to resume for JHMDB-Sentences"
         print("============================================>")
         print("JHMDB-Sentences are directly evaluated using the checkpoint trained on A2D-Sentences")
-        print("Load checkpoint weights from {} ...".format(args.pretrained_weights))
+        print(f"Load checkpoint weights from {args.pretrained_weights} ...")
         # load checkpoint in the args.resume
         print("============================================>")
 
     # for Ref-Youtube-VOS and A2D-Sentences
     # finetune using the pretrained weights on Ref-COCO
-    if args.dataset_file != "davis" and args.dataset_file != "jhmdb" and args.pretrained_weights is not None:
+    if args.dataset_file not in ["davis", "jhmdb"] and args.pretrained_weights is not None:
         print("============================================>")
-        print("Load pretrained weights from {} ...".format(args.pretrained_weights))
+        print(f"Load pretrained weights from {args.pretrained_weights} ...")
         checkpoint = torch.load(args.pretrained_weights, map_location="cpu")
         checkpoint_dict = pre_trained_model_to_finetune(checkpoint, args)
         model_without_ddp.load_state_dict(checkpoint_dict, strict=False)
         print("============================================>")
 
-
     output_dir = Path(args.output_dir)
     if args.resume:
         if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
+            checkpoint = torch.hub.load_state_dict_from_url(args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:
-            print('Missing Keys: {}'.format(missing_keys))
+            print(f'Missing Keys: {missing_keys}')
         if len(unexpected_keys) > 0:
-            print('Unexpected Keys: {}'.format(unexpected_keys))
+            print(f'Unexpected Keys: {unexpected_keys}')
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
@@ -177,27 +180,35 @@ def main(args):
             # todo: this is a hack for doing experiment that resume from checkpoint and also modify lr scheduler (e.g., decrease lr in advance).
             args.override_resumed_lr_drop = True
             if args.override_resumed_lr_drop:
-                print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
+                print(
+                    'Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
                 lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
-        assert args.dataset_file == 'a2d' or args.dataset_file == 'jhmdb', \
-                    'Only A2D-Sentences and JHMDB-Sentences datasets support evaluation'
+        assert args.dataset_file in ['a2d',
+                                     'jhmdb'], 'Only A2D-Sentences and JHMDB-Sentences datasets support evaluation'
         test_stats = evaluate_a2d(model, data_loader_val, postprocessor, device, args)
         return
 
-
     print("Start training")
+    monitor_process = mp.Process(target=monitor_gpu)
+    monitor_process.start()
+
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            print('len(data_loader_train): ', len(data_loader_train))
+        train_stats = train_one_epoch(model, criterion, data_loader_train, optimizer, device, epoch,
+                                      args.clip_max_norm)
+        for n, p in model_without_ddp.named_parameters():
+            if p.grad is None:
+                print(f"Parameter {n} has no gradient")
+            elif torch.all(p.grad == 0):
+                print(f"Parameter {n} has zero gradient")
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -214,8 +225,7 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch,
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch,
                      'n_parameters': n_parameters}
 
         if args.dataset_file == 'a2d':
@@ -226,10 +236,32 @@ def main(args):
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print(f'Training time {total_time_str}')
+    cleanup()
+    monitor_process.terminate()
+    monitor_process.join()
+
+
+def monitor_gpu(interval=60 * 2):
+    while True:
+        gpus = GPUtil.getGPUs()
+        for gpu in gpus:
+            print(f"GPU {gpu.id}: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB")
+        time.sleep(interval)
+
+
+def setup():
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    return rank, world_size
+
+
+def cleanup():
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
@@ -238,6 +270,3 @@ if __name__ == '__main__':
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
-
-
-
