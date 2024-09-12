@@ -2,43 +2,44 @@
 ReferFormer model class.
 Modified from DETR (https://github.com/facebookresearch/detr)
 """
-import torch
-import torch.nn.functional as F
-from torch import nn
-
-import os
-import math
-from util import box_ops
-from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
-                       nested_tensor_from_videos_list,
-                       accuracy, get_world_size, interpolate,
-                       is_dist_avail_and_initialized, inverse_sigmoid)
-
-from .position_encoding import PositionEmbeddingSine1D
-from .backbone import build_backbone
-from .deformable_transformer import build_deforamble_transformer
-from .segmentation import CrossModalFPNDecoder, VisionLanguageFusionModule
-from .matcher import build_matcher
-from .criterion import SetCriterion
-from .postprocessors import build_postprocessors
-
-from transformers import BertTokenizer, BertModel, RobertaModel, RobertaTokenizerFast
 
 import copy
+import math
+import os
+
+import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch import nn
+from transformers import RobertaModel, RobertaTokenizerFast
+
+from util.misc import (NestedTensor, nested_tensor_from_videos_list,
+                       inverse_sigmoid)
+from .backbone import build_backbone
+from .criterion import SetCriterion
+from .deformable_transformer import build_deforamble_transformer
+from .gnn_fusion_raw import MultimodalGNN
+from .matcher import build_matcher
+from .position_encoding import PositionEmbeddingSine1D
+from .postprocessors import build_postprocessors
+from .segmentation import CrossModalFPNDecoder, VisionLanguageFusionModule
+
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
+
 
 class ReferFormer(nn.Module):
     """ This is the ReferFormer module that performs referring video object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels, 
-                    num_frames, mask_dim, dim_feedforward,
-                    controller_layers, dynamic_mask_channels, 
-                    aux_loss=False, with_box_refine=False, two_stage=False, 
-                    freeze_text_encoder=False, rel_coord=True):
+
+    def __init__(self, backbone, motion_backbone, transformer, num_classes, num_queries, num_feature_levels,
+                 num_frames, mask_dim, dim_feedforward,
+                 controller_layers, dynamic_mask_channels,
+                 aux_loss=False, with_box_refine=False, two_stage=False,
+                 freeze_text_encoder=False, rel_coord=True):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -60,40 +61,61 @@ class ReferFormer(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
-        
+
         # Build Transformer
         # NOTE: different deformable detr, the query_embed out channels is
         # hidden_dim instead of hidden_dim * 2
         # This is because, the input to the decoder is text embedding feature
-        self.query_embed = nn.Embedding(num_queries, hidden_dim) 
-        
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+
         # follow deformable-detr, we use the last three stages of backbone
         if num_feature_levels > 1:
             num_backbone_outs = len(backbone.strides[-3:])
-            input_proj_list = []
+            input_proj_list, motion_proj_list = [], []
             for _ in range(num_backbone_outs):
                 in_channels = backbone.num_channels[-3:][_]
                 input_proj_list.append(nn.Sequential(
                     nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
                     nn.GroupNorm(32, hidden_dim),
                 ))
-            for _ in range(num_feature_levels - num_backbone_outs): # downsample 2x
+            for _ in range(num_feature_levels - num_backbone_outs):  # downsample 2x
                 input_proj_list.append(nn.Sequential(
+                    nn.Conv2d(backbone.num_channels[-3:][-1], hidden_dim, kernel_size=3, stride=2, padding=1),
+                    nn.GroupNorm(32, hidden_dim),
+                ))
+            self.input_proj = nn.ModuleList(input_proj_list)
+
+            num_backbone_outs = len(motion_backbone.strides[-3:])
+            for _ in range(num_backbone_outs):
+                in_channels = motion_backbone.num_channels[-3:][_]
+                motion_proj_list.append(nn.Sequential(
+                    nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
+                    nn.GroupNorm(32, hidden_dim),
+                ))
+
+            for _ in range(num_feature_levels - num_backbone_outs):  # downsample 2x
+                in_channels = motion_backbone.num_channels[-3:][-1]
+                motion_proj_list.append(nn.Sequential(
                     nn.Conv2d(in_channels, hidden_dim, kernel_size=3, stride=2, padding=1),
                     nn.GroupNorm(32, hidden_dim),
                 ))
-                in_channels = hidden_dim
-            self.input_proj = nn.ModuleList(input_proj_list)
+            self.motion_proj = nn.ModuleList(motion_proj_list)
         else:
             self.input_proj = nn.ModuleList([
                 nn.Sequential(
                     nn.Conv2d(backbone.num_channels[-3:][0], hidden_dim, kernel_size=1),
                     nn.GroupNorm(32, hidden_dim),
                 )])
+            self.motion_proj = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(motion_backbone.num_channels[-3:][0], hidden_dim, kernel_size=1),
+                    nn.GroupNorm(32, hidden_dim),
+                )])
 
         self.num_frames = num_frames
         self.mask_dim = mask_dim
         self.backbone = backbone
+        self.motion_backbone = motion_backbone
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
         assert two_stage == False, "args.two_stage must be false!"
@@ -105,7 +127,11 @@ class ReferFormer(nn.Module):
         nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
         for proj in self.input_proj:
-            nn.init.xavier_uniform_(proj[0].weight, gain=1)
+            nn.init.kaiming_uniform_(proj[0].weight, nonlinearity='relu')  # 使用 Kaiming 初始化
+            nn.init.constant_(proj[0].bias, 0)
+
+        for proj in self.motion_proj:
+            nn.init.kaiming_uniform_(proj[0].weight, nonlinearity='relu')  # 使用 Kaiming 初始化
             nn.init.constant_(proj[0].bias, 0)
 
         num_pred = transformer.decoder.num_layers
@@ -124,13 +150,16 @@ class ReferFormer(nn.Module):
         # Build Text Encoder
         # self.tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
         # self.text_encoder = BertModel.from_pretrained('bert-base-cased')
-        self.tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-        self.text_encoder = RobertaModel.from_pretrained('roberta-base')
+        # self.tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
+        # self.text_encoder = RobertaModel.from_pretrained('roberta-base')
+
+        self.tokenizer = RobertaTokenizerFast.from_pretrained('models/roberta-base')
+        self.text_encoder = RobertaModel.from_pretrained('models/roberta-base')
 
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
                 p.requires_grad_(False)
-        
+
         # resize the bert output channel to transformer d_model
         self.resizer = FeatureResizer(
             input_feat_size=768,
@@ -139,16 +168,17 @@ class ReferFormer(nn.Module):
         )
 
         self.fusion_module = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
+        self.modality_fusion = MultimodalGNN(256, 6, 4)
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
 
         # Build FPN Decoder
         self.rel_coord = rel_coord
         feature_channels = [self.backbone.num_channels[0]] + 3 * [hidden_dim]
-        self.pixel_decoder = CrossModalFPNDecoder(feature_channels=feature_channels, conv_dim=hidden_dim, 
+        self.pixel_decoder = CrossModalFPNDecoder(feature_channels=feature_channels, conv_dim=hidden_dim,
                                                   mask_dim=mask_dim, dim_feedforward=dim_feedforward, norm="GN")
 
         # Build Dynamic Conv
-        self.controller_layers = controller_layers 
+        self.controller_layers = controller_layers
         self.in_channels = mask_dim
         self.dynamic_mask_channels = dynamic_mask_channels
         self.mask_out_stride = 4
@@ -163,7 +193,7 @@ class ReferFormer(nn.Module):
                     weight_nums.append(self.in_channels * self.dynamic_mask_channels)
                 bias_nums.append(self.dynamic_mask_channels)
             elif l == self.controller_layers - 1:
-                weight_nums.append(self.dynamic_mask_channels * 1) # output layer c -> 1
+                weight_nums.append(self.dynamic_mask_channels * 1)  # output layer c -> 1
                 bias_nums.append(1)
             else:
                 weight_nums.append(self.dynamic_mask_channels * self.dynamic_mask_channels)
@@ -176,11 +206,10 @@ class ReferFormer(nn.Module):
         self.controller = MLP(hidden_dim, hidden_dim, self.num_gen_params, 3)
         for layer in self.controller.layers:
             nn.init.zeros_(layer.bias)
-            nn.init.xavier_uniform_(layer.weight)   
-        
+            nn.init.xavier_uniform_(layer.weight)
 
-    def forward(self, samples: NestedTensor, captions, targets):
-        """ The forward expects a NestedTensor, which consists of:
+    def forward(self, samples, flows, captions, targets):
+        """The forward expects a NestedTensor, which consists of:
                - samples.tensors: image sequences, of shape [num_frames x 3 x H x W]
                - samples.mask: a binary mask of shape [num_frames x H x W], containing 1 on padded pixels
                - captions: list[str]
@@ -196,27 +225,34 @@ class ReferFormer(nn.Module):
                                relative to the size of each individual image (disregarding possible padding).
                                See PostProcess for information on how to retrieve the unnormalized bounding box.
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
-                                dictionnaries containing the two above keys for each decoder layer.
+                                dictionaries containing the two above keys for each decoder layer.
         """
         # Backbone
         if not isinstance(samples, NestedTensor):
-            samples = nested_tensor_from_videos_list(samples) 
+            samples = nested_tensor_from_videos_list(samples)
+        if not isinstance(flows, NestedTensor):
+            flows = nested_tensor_from_videos_list(flows)
 
         # features (list[NestedTensor]): res2 -> res5, shape of tensors is [B*T, Ci, Hi, Wi]
         # pos (list[Tensor]): shape of [B*T, C, Hi, Wi]
-        features, pos = self.backbone(samples) 
+        features, pos = self.backbone(samples)
+        motion_features, motion_position = self.motion_backbone(flows)
 
         b = len(captions)
         t = pos[0].shape[0] // b
 
         # For A2D-Sentences and JHMDB-Sentencs dataset, only one frame is annotated for a clip
         if 'valid_indices' in targets[0]:
-            valid_indices = torch.tensor([i * t + target['valid_indices'] for i, target in enumerate(targets)]).to(pos[0].device)
-            for feature in features:
-                feature.tensors = feature.tensors.index_select(0, valid_indices)
-                feature.mask = feature.mask.index_select(0, valid_indices)
-            for i, p in enumerate(pos):
-                pos[i] = p.index_select(0, valid_indices)
+            valid_indices = torch.tensor([i * t + target['valid_indices'] for i, target in enumerate(targets)]).to(
+                pos[0].device)
+            for vf, mf in zip(features, motion_features):
+                vf.tensors = vf.tensors.index_select(0, valid_indices)
+                vf.mask = vf.mask.index_select(0, valid_indices)
+                mf.tensors = mf.tensors.index_select(0, valid_indices)
+
+            for i, (vp, mp) in enumerate(zip(pos, motion_position)):
+                pos[i] = vp.index_select(0, valid_indices)
+                motion_position[i] = mp.index_select(0, valid_indices)
             samples.mask = samples.mask.index_select(0, valid_indices)
             # t: num_frames -> 1
             t = 1
@@ -229,66 +265,92 @@ class ReferFormer(nn.Module):
         poses = []
 
         text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
-        text_word_features, text_word_masks = text_features.decompose() 
+        text_word_features, text_word_masks = text_features.decompose()
         text_word_features = text_word_features.permute(1, 0, 2)  # [length, batch_size, c]
-        
+
         # Follow Deformable-DETR, we use the last three stages outputs from backbone
-        for l, (feat, pos_l) in enumerate(zip(features[-3:], pos[-3:])): 
-            src, mask = feat.decompose()            
-            src_proj_l = self.input_proj[l](src)    
+        for l, (feat, pos_l, m_feat, m_pos) in enumerate(
+                zip(features[-3:], pos[-3:], motion_features[-3:], motion_position[-3:])):
+            src, mask = feat.decompose()
+            src_proj_l = self.input_proj[l](src)
             n, c, h, w = src_proj_l.shape
 
             # vision language early-fusion
             src_proj_l = rearrange(src_proj_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
             src_proj_l = self.fusion_module(tgt=src_proj_l,
-                                             memory=text_word_features,
-                                             memory_key_padding_mask=text_word_masks,
-                                             pos=text_pos,
-                                             query_pos=None
-            ) 
-            src_proj_l = rearrange(src_proj_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
+                                            memory=text_word_features,
+                                            memory_key_padding_mask=text_word_masks,
+                                            pos=text_pos,
+                                            query_pos=None
+                                            )
+            src_proj_l = rearrange(src_proj_l, '(t h w) b c -> b t c h w', t=t, h=h, w=w)
+
+            # GNN Modality Fusion
+            m_proj_l = self.motion_proj[l](m_feat.decompose()[0])
+            m_proj_l = rearrange(m_proj_l, '(b t) c h w -> b t c h w', t=t)
+            m_pos = rearrange(m_pos, '(b t) c h w -> b t c h w', t=t)
+            v_pos = rearrange(pos_l, '(b t) c h w -> b t c h w', t=t)
+
+            text_feat = text_word_features.permute(1, 2, 0).contiguous()
+            text_feat_pos = text_pos.permute(1, 2, 0).contiguous()
+            src_proj_l = self.modality_fusion(((src_proj_l, v_pos), (m_proj_l, m_pos), (text_feat, text_feat_pos)))[0]
 
             srcs.append(src_proj_l)
             masks.append(mask)
             poses.append(pos_l)
             assert mask is not None
-        
+
         if self.num_feature_levels > (len(features) - 1):
-            _len_srcs = len(features) - 1 # fpn level
+            _len_srcs = len(features) - 1  # fpn level
             for l in range(_len_srcs, self.num_feature_levels):
                 if l == _len_srcs:
                     src = self.input_proj[l](features[-1].tensors)
+                    m_feat = self.motion_proj[l](motion_features[-1].tensors)
                 else:
                     src = self.input_proj[l](srcs[-1])
+                    m_feat = self.motion_proj[l](motion_features[-1].tensors)  # todo require...
                 m = samples.mask
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                m_pos = self.motion_backbone[1](NestedTensor(m_feat, None))
                 n, c, h, w = src.shape
+                assert not torch.isinf(src).any(), f"src contains infinite: {src},lvl: {l}"
+
+                assert not torch.isnan(src).any(), f"src contains NaN: {src},lvl: {l}"
 
                 # vision language early-fusion
                 src = rearrange(src, '(b t) c h w -> (t h w) b c', b=b, t=t)
                 src = self.fusion_module(tgt=src,
-                                          memory=text_word_features,
-                                          memory_key_padding_mask=text_word_masks,
-                                          pos=text_pos,
-                                          query_pos=None
-                )
-                src = rearrange(src, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
+                                         memory=text_word_features,
+                                         memory_key_padding_mask=text_word_masks,
+                                         pos=text_pos,
+                                         query_pos=None
+                                         )
+                src = rearrange(src, '(t h w) b c -> b t c h w', t=t, h=h, w=w)
+
+                m_feat = rearrange(m_feat, '(b t) c h w -> b t c h w', t=t)
+                m_pos = rearrange(m_pos, '(b t) c h w -> b t c h w', t=t)
+                v_pos = rearrange(pos_l, '(b t) c h w -> b t c h w', t=t)
+
+                text_feat = text_word_features.permute(1, 2, 0).contiguous()
+                text_feat_pos = text_pos.permute(1, 2, 0).contiguous()
+                src = self.modality_fusion(((src, v_pos), (m_feat, m_pos), (text_feat, text_feat_pos)))[0]
 
                 srcs.append(src)
+                assert not torch.isnan(src).any(), f"src contains NaN: {src},lvl: {l}"
                 masks.append(mask)
                 poses.append(pos_l)
-        
+
         # Transformer
         query_embeds = self.query_embed.weight  # [num_queries, c]
         text_embed = repeat(text_sentence_features, 'b c -> b t q c', t=t, q=self.num_queries)
         hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, inter_samples = \
-                                            self.transformer(srcs, text_embed, masks, poses, query_embeds)
+            self.transformer(srcs, text_embed, masks, poses, query_embeds)
         # hs: [l, batch_size*time, num_queries_per_frame, c]
         # memory: list[Tensor], shape of tensor is [batch_size*time, c, hi, wi]
         # init_reference: [batch_size*time, num_queries_per_frame, 2]
         # inter_references: [l, batch_size*time, num_queries_per_frame, 4]
-        
+
         out = {}
         # prediction
         outputs_classes = []
@@ -299,14 +361,19 @@ class ReferFormer(nn.Module):
             else:
                 reference = inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
+            assert not torch.isnan(reference).any(), f"Reference contains NaN: {reference}"
             outputs_class = self.class_embed[lvl](hs[lvl])
+            assert not torch.isnan(hs[lvl]).any(), f"hs[lvl] contains NaN: {hs[lvl]}"
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid() # cxcywh, range in [0,1]
+
+            assert not torch.isnan(tmp).any(), f"Tmp contains NaN: {tmp}"
+            outputs_coord = tmp.sigmoid()
+            assert not torch.isnan(outputs_coord).any(), f"Outputs_coord contains NaN: {outputs_coord}"
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
         outputs_class = torch.stack(outputs_classes)
@@ -314,32 +381,34 @@ class ReferFormer(nn.Module):
         # rearrange
         outputs_class = rearrange(outputs_class, 'l (b t) q k -> l b t q k', b=b, t=t)
         outputs_coord = rearrange(outputs_coord, 'l (b t) q n -> l b t q n', b=b, t=t)
-        out['pred_logits'] = outputs_class[-1] # [batch_size, time, num_queries_per_frame, num_classes]
+        out['pred_logits'] = outputs_class[-1]  # [batch_size, time, num_queries_per_frame, num_classes]
         out['pred_boxes'] = outputs_coord[-1]  # [batch_size, time, num_queries_per_frame, 4]
 
         # Segmentation
-        mask_features = self.pixel_decoder(features, text_features, pos, memory, nf=t) # [batch_size*time, c, out_h, out_w]
+        mask_features = self.pixel_decoder(features, text_features, pos, memory,
+                                           nf=t)  # [batch_size*time, c, out_h, out_w]
         mask_features = rearrange(mask_features, '(b t) c h w -> b t c h w', b=b, t=t)
 
         # dynamic conv
         outputs_seg_masks = []
         for lvl in range(hs.shape[0]):
-            dynamic_mask_head_params = self.controller(hs[lvl])   # [batch_size*time, num_queries_per_frame, num_params]
+            dynamic_mask_head_params = self.controller(hs[lvl])  # [batch_size*time, num_queries_per_frame, num_params]
             dynamic_mask_head_params = rearrange(dynamic_mask_head_params, '(b t) q n -> b (t q) n', b=b, t=t)
             lvl_references = inter_references[lvl, ..., :2]
             lvl_references = rearrange(lvl_references, '(b t) q n -> b (t q) n', b=b, t=t)
-            outputs_seg_mask = self.dynamic_mask_with_coords(mask_features, dynamic_mask_head_params, lvl_references, targets)
+            outputs_seg_mask = self.dynamic_mask_with_coords(mask_features, dynamic_mask_head_params, lvl_references,
+                                                             targets)
             outputs_seg_mask = rearrange(outputs_seg_mask, 'b (t q) h w -> b t q h w', t=t)
             outputs_seg_masks.append(outputs_seg_mask)
         out['pred_masks'] = outputs_seg_masks[-1]  # [batch_size, time, num_queries_per_frame, out_h, out_w]
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, outputs_seg_masks)
-        
+
         if not self.training:
             # for visualization
             inter_references = inter_references[-2, :, :, :2]  # [batch_size*time, num_queries_per_frame, 2]
-            inter_references = rearrange(inter_references, '(b t) q n -> b t q n', b=b, t=t) 
+            inter_references = rearrange(inter_references, '(b t) q n -> b t q n', b=b, t=t)
             out['reference_points'] = inter_references  # the reference points of last layer input
         return out
 
@@ -348,7 +417,7 @@ class ReferFormer(nn.Module):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{"pred_logits": a, "pred_boxes": b, "pred_masks": c} 
+        return [{"pred_logits": a, "pred_boxes": b, "pred_masks": c}
                 for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_seg_masks[:-1])]
 
     def forward_text(self, captions, device):
@@ -360,13 +429,13 @@ class ReferFormer(nn.Module):
             text_attention_mask = tokenized.attention_mask.ne(1).bool()
             # text_attention_mask: [batch_size, length]
 
-            text_features = encoded_text.last_hidden_state 
-            text_features = self.resizer(text_features)    
-            text_masks = text_attention_mask              
-            text_features = NestedTensor(text_features, text_masks) # NestedTensor
+            text_features = encoded_text.last_hidden_state
+            text_features = self.resizer(text_features)
+            text_masks = text_attention_mask
+            text_features = NestedTensor(text_features, text_masks)  # NestedTensor
 
-            text_sentence_features = encoded_text.pooler_output  
-            text_sentence_features = self.resizer(text_sentence_features)  
+            text_sentence_features = encoded_text.pooler_output
+            text_sentence_features = self.resizer(text_sentence_features)
         else:
             raise ValueError("Please mask sure the caption is a list of string")
         return text_features, text_sentence_features
@@ -388,44 +457,47 @@ class ReferFormer(nn.Module):
         device = mask_features.device
         b, t, c, h, w = mask_features.shape
         # this is the total query number in all frames
-        _, num_queries = reference_points.shape[:2]  
+        _, num_queries = reference_points.shape[:2]
         q = num_queries // t  # num_queries_per_frame
 
         # prepare reference points in image size (the size is input size to the model)
-        new_reference_points = [] 
+        new_reference_points = []
         for i in range(b):
             img_h, img_w = targets[i]['size']
-            scale_f = torch.stack([img_w, img_h], dim=0) 
-            tmp_reference_points = reference_points[i] * scale_f[None, :] 
+            scale_f = torch.stack([img_w, img_h], dim=0)
+            tmp_reference_points = reference_points[i] * scale_f[None, :]
             new_reference_points.append(tmp_reference_points)
-        new_reference_points = torch.stack(new_reference_points, dim=0) 
+        new_reference_points = torch.stack(new_reference_points, dim=0)
         # [batch_size, time * num_queries_per_frame, 2], in image size
-        reference_points = new_reference_points  
+        reference_points = new_reference_points
 
         # prepare the mask features
         if self.rel_coord:
-            reference_points = rearrange(reference_points, 'b (t q) n -> b t q n', t=t, q=q) 
-            locations = compute_locations(h, w, device=device, stride=self.mask_feat_stride) 
+            reference_points = rearrange(reference_points, 'b (t q) n -> b t q n', t=t, q=q)
+            locations = compute_locations(h, w, device=device, stride=self.mask_feat_stride)
             relative_coords = reference_points.reshape(b, t, q, 1, 1, 2) - \
-                                    locations.reshape(1, 1, 1, h, w, 2) # [batch_size, time, num_queries_per_frame, h, w, 2]
-            relative_coords = relative_coords.permute(0, 1, 2, 5, 3, 4) # [batch_size, time, num_queries_per_frame, 2, h, w]
+                              locations.reshape(1, 1, 1, h, w, 2)  # [batch_size, time, num_queries_per_frame, h, w, 2]
+            relative_coords = relative_coords.permute(0, 1, 2, 5, 3,
+                                                      4)  # [batch_size, time, num_queries_per_frame, 2, h, w]
 
             # concat features
-            mask_features = repeat(mask_features, 'b t c h w -> b t q c h w', q=q) # [batch_size, time, num_queries_per_frame, c, h, w]
+            mask_features = repeat(mask_features, 'b t c h w -> b t q c h w',
+                                   q=q)  # [batch_size, time, num_queries_per_frame, c, h, w]
             mask_features = torch.cat([mask_features, relative_coords], dim=3)
         else:
-            mask_features = repeat(mask_features, 'b t c h w -> b t q c h w', q=q) # [batch_size, time, num_queries_per_frame, c, h, w]
-        mask_features = mask_features.reshape(1, -1, h, w) 
+            mask_features = repeat(mask_features, 'b t c h w -> b t q c h w',
+                                   q=q)  # [batch_size, time, num_queries_per_frame, c, h, w]
+        mask_features = mask_features.reshape(1, -1, h, w)
 
         # parse dynamic params
-        mask_head_params = mask_head_params.flatten(0, 1) 
+        mask_head_params = mask_head_params.flatten(0, 1)
         weights, biases = parse_dynamic_params(
             mask_head_params, self.dynamic_mask_channels,
             self.weight_nums, self.bias_nums
         )
 
         # dynamic mask conv
-        mask_logits = self.mask_heads_forward(mask_features, weights, biases, mask_head_params.shape[0]) 
+        mask_logits = self.mask_heads_forward(mask_features, weights, biases, mask_head_params.shape[0])
         mask_logits = mask_logits.reshape(-1, 1, h, w)
 
         # upsample predicted masks
@@ -483,8 +555,9 @@ def parse_dynamic_params(params, channels, weight_nums, bias_nums):
 
     return weight_splits, bias_splits
 
+
 def aligned_bilinear(tensor, factor):
-    assert tensor.dim() == 4 
+    assert tensor.dim() == 4
     assert factor >= 1
     assert int(factor) == factor
 
@@ -524,7 +597,6 @@ def compute_locations(h, w, device, stride=1):
     return locations
 
 
-
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
@@ -538,6 +610,7 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+
 
 class FeatureResizer(nn.Module):
     """
@@ -566,30 +639,30 @@ def build(args):
         num_classes = 1
     else:
         if args.dataset_file == 'ytvos':
-            num_classes = 65 
+            num_classes = 65
         elif args.dataset_file == 'davis':
             num_classes = 78
         elif args.dataset_file == 'a2d' or args.dataset_file == 'jhmdb':
             num_classes = 1
-        else: 
-            num_classes = 91 # for coco
+        else:
+            num_classes = 91  # for coco
     device = torch.device(args.device)
 
-    # backbone
-    if 'video_swin' in args.backbone:
+    # vision backbone
+    if 'video_swin' in args.vision_backbone:
         from .video_swin_transformer import build_video_swin_backbone
-        backbone = build_video_swin_backbone(args)
-    elif 'swin' in args.backbone:
+        vision_backbone, motion_backbone = build_video_swin_backbone(args)
+    elif 'swin' in args.vision_backbone:
         from .swin_transformer import build_swin_backbone
-        backbone = build_swin_backbone(args) 
+        vision_backbone, motion_backbone = build_swin_backbone(args)
     else:
-        backbone = build_backbone(args)
+        vision_backbone, motion_backbone = build_backbone(args)
 
     transformer = build_deforamble_transformer(args)
-
     model = ReferFormer(
-        backbone,
-        transformer,
+        backbone=vision_backbone,
+        motion_backbone=motion_backbone,
+        transformer=transformer,
         num_classes=num_classes,
         num_queries=args.num_queries,
         num_feature_levels=args.num_feature_levels,
@@ -604,12 +677,13 @@ def build(args):
         freeze_text_encoder=args.freeze_text_encoder,
         rel_coord=args.rel_coord
     )
+
     matcher = build_matcher(args)
     weight_dict = {}
     weight_dict['loss_ce'] = args.cls_loss_coef
     weight_dict['loss_bbox'] = args.bbox_loss_coef
     weight_dict['loss_giou'] = args.giou_loss_coef
-    if args.masks: # always true
+    if args.masks:  # always true
         weight_dict['loss_mask'] = args.mask_loss_coef
         weight_dict['loss_dice'] = args.dice_loss_coef
     # TODO this is a hack
@@ -623,17 +697,19 @@ def build(args):
     if args.masks:
         losses += ['masks']
     criterion = SetCriterion(
-            num_classes, 
-            matcher=matcher,
-            weight_dict=weight_dict, 
-            eos_coef=args.eos_coef, 
-            losses=losses,
-            focal_alpha=args.focal_alpha)
+        num_classes,
+        matcher=matcher,
+        weight_dict=weight_dict,
+        eos_coef=args.eos_coef,
+        losses=losses,
+        focal_alpha=args.focal_alpha)
     criterion.to(device)
 
     # postprocessors, this is used for coco pretrain but not for rvos
     postprocessors = build_postprocessors(args, args.dataset_file)
     return model, criterion, postprocessors
 
-
-
+# if __name__ == '__main__':
+#     parser = argparse.ArgumentParser('ReferFormer inference script', parents=[opts.get_args_parser()])
+#     args = parser.parse_args()
+#     model, _, _ = build(args)
