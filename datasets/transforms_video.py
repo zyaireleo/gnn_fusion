@@ -16,12 +16,12 @@ from PIL import Image
 import cv2
 
 
-
 class Check(object):
     def __init__(self,):
         pass
-    def __call__(self,  img, target):
-        fields = ["labels"]  
+
+    def __call__(self, img, flow, target):
+        fields = ["labels"]
         if "boxes" in target:
             fields.append("boxes")
         if "masks" in target:
@@ -38,12 +38,11 @@ class Check(object):
             if False in keep:
                 for k in range(len(keep)):
                     if not keep[k] and "boxes" in target:
-                        target['boxes'][k] = target['boxes'][k]//1000.0  # [0, 0, 0, 0]
-            
+                        target['boxes'][k] = target['boxes'][k] // 1000.0  # [0, 0, 0, 0]
+
         target['valid'] = keep.to(torch.int32)
 
-        return  img, target
-
+        return img, flow, target
 
 
 def bbox_overlaps(bboxes1, bboxes2, mode='iou', eps=1e-6):
@@ -79,10 +78,11 @@ def bbox_overlaps(bboxes1, bboxes2, mode='iou', eps=1e-6):
     return ious
 
 
-def crop(clip, target, region):
-    cropped_image = []
-    for image in clip:
+def crop(clip, flow, target, region):
+    cropped_image, cropped_flows = [], []
+    for _, (image, fl) in enumerate(zip(clip, flow)):
         cropped_image.append(F.crop(image, *region))
+        cropped_flows.append(F.crop(fl, *region))
 
     target = target.copy()
     i, j, h, w = region
@@ -108,13 +108,15 @@ def crop(clip, target, region):
         target['masks'] = target['masks'][:, i:i + h, j:j + w]
         fields.append("masks")
 
-    return cropped_image, target
+    return cropped_image, cropped_flows, target
 
 
-def hflip(clip, target):
-    flipped_image = []
+def hflip(clip, flow, target):
+    flipped_image, flipped_flow = [], []
     for image in clip:
         flipped_image.append(F.hflip(image))
+    for fl in flow:
+        flipped_flow.append(F.hflip(fl))
 
     w, h = clip[0].size
 
@@ -126,13 +128,16 @@ def hflip(clip, target):
 
     if "masks" in target:
         target['masks'] = target['masks'].flip(-1)
-    
-    return flipped_image, target
 
-def vflip(image,target):
-    flipped_image = []
+    return flipped_image, flipped_flow, target
+
+
+def vflip(clip, flows, target):
+    flipped_image, flipped_flow = [], []
     for image in clip:
         flipped_image.append(F.vflip(image))
+    for flow in flows:
+        flipped_flow.append(F.vflip(flow))
     w, h = clip[0].size
     target = target.copy()
     if "boxes" in target:
@@ -145,12 +150,14 @@ def vflip(image,target):
 
     return flipped_image, target
 
-def resize(clip, target, size, max_size=None):
+
+def resize(clip, flow, target, size, max_size=None):
     # size can be min_size (scalar) or (w, h) tuple
 
     def get_size_with_aspect_ratio(image_size, size, max_size=None):
         w, h = image_size
         if max_size is not None:
+
             min_original_size = float(min((w, h)))
             max_original_size = float(max((w, h)))
             if max_original_size / min_original_size * size > max_size:
@@ -175,12 +182,13 @@ def resize(clip, target, size, max_size=None):
             return get_size_with_aspect_ratio(image_size, size, max_size)
 
     size = get_size(clip[0].size, size, max_size)
-    rescaled_image = []
-    for image in clip:
+    rescaled_image, rescaled_flows = [], []
+    for _, (image, fl) in enumerate(zip(clip, flow)):
         rescaled_image.append(F.resize(image, size))
+        rescaled_flows.append(F.resize(fl, size))
 
     if target is None:
-        return rescaled_image, None
+        return rescaled_image, rescaled_flows, None
 
     ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_image[0].size, clip[0].size))
     ratio_width, ratio_height = ratios
@@ -200,12 +208,12 @@ def resize(clip, target, size, max_size=None):
     target["size"] = torch.tensor([h, w])
 
     if "masks" in target:
-        if target['masks'].shape[0]>0:
+        if target['masks'].shape[0] > 0:
             target['masks'] = interpolate(
                 target['masks'][:, None].float(), size, mode="nearest")[:, 0] > 0.5
         else:
-            target['masks'] = torch.zeros((target['masks'].shape[0],h,w))
-    return rescaled_image, target
+            target['masks'] = torch.zeros((target['masks'].shape[0], h, w))
+    return rescaled_image, rescaled_flows, target
 
 
 def pad(clip, target, padding):
@@ -227,9 +235,9 @@ class RandomCrop(object):
     def __init__(self, size):
         self.size = size
 
-    def __call__(self, img, target):
+    def __call__(self, img, flows, target):
         region = T.RandomCrop.get_params(img, self.size)
-        return crop(img, target, region)
+        return crop(img, flows, target, region)
 
 
 class RandomSizeCrop(object):
@@ -237,11 +245,11 @@ class RandomSizeCrop(object):
         self.min_size = min_size
         self.max_size = max_size
 
-    def __call__(self, img: PIL.Image.Image, target: dict):
+    def __call__(self, img: PIL.Image.Image, flow, target: dict):
         w = random.randint(self.min_size, min(img[0].width, self.max_size))
         h = random.randint(self.min_size, min(img[0].height, self.max_size))
         region = T.RandomCrop.get_params(img[0], [h, w])
-        return crop(img, target, region)
+        return crop(img, flow, target, region)
 
 
 class CenterCrop(object):
@@ -263,12 +271,12 @@ class MinIoURandomCrop(object):
         self.min_crop_size = min_crop_size
 
     def __call__(self, img, target):
-        w,h = img.size
+        w, h = img.size
         while True:
             mode = random.choice(self.sample_mode)
             self.mode = mode
             if mode == 1:
-                return img,target
+                return img, target
             min_iou = mode
             boxes = target['boxes'].numpy()
             labels = target['labels']
@@ -286,30 +294,32 @@ class MinIoURandomCrop(object):
                 overlaps = bbox_overlaps(patch.reshape(-1, 4), boxes.reshape(-1, 4)).reshape(-1)
                 if len(overlaps) > 0 and overlaps.min() < min_iou:
                     continue
-                
+
                 if len(overlaps) > 0:
                     def is_center_of_bboxes_in_patch(boxes, patch):
                         center = (boxes[:, :2] + boxes[:, 2:]) / 2
-                        mask = ((center[:, 0] > patch[0]) * (center[:, 1] > patch[1]) * (center[:, 0] < patch[2]) * (center[:, 1] < patch[3]))
+                        mask = ((center[:, 0] > patch[0]) * (center[:, 1] > patch[1]) * (center[:, 0] < patch[2]) * (
+                                center[:, 1] < patch[3]))
                         return mask
+
                     mask = is_center_of_bboxes_in_patch(boxes, patch)
                     if False in mask:
                         continue
-                    #TODO: use no center boxes
-                    #if not mask.any():
+                    # TODO: use no center boxes
+                    # if not mask.any():
                     #    continue
 
                     boxes[:, 2:] = boxes[:, 2:].clip(max=patch[2:])
                     boxes[:, :2] = boxes[:, :2].clip(min=patch[:2])
                     boxes -= np.tile(patch[:2], 2)
                     target['boxes'] = torch.tensor(boxes)
-                
+
                 img = np.asarray(img)[patch[1]:patch[3], patch[0]:patch[2]]
                 img = Image.fromarray(img)
                 width, height = img.size
-                target['orig_size'] = torch.tensor([height,width])
-                target['size'] = torch.tensor([height,width])
-                return img,target 
+                target['orig_size'] = torch.tensor([height, width])
+                target['size'] = torch.tensor([height, width])
+                return img, target
 
 
 class RandomContrast(object):
@@ -318,23 +328,26 @@ class RandomContrast(object):
         self.upper = upper
         assert self.upper >= self.lower, "contrast upper must be >= lower."
         assert self.lower >= 0, "contrast lower must be non-negative."
-    def __call__(self, image, target):
-        
+
+    def __call__(self, image, flow, target):
         if rand.randint(2):
             alpha = rand.uniform(self.lower, self.upper)
             image *= alpha
-        return image, target
+        return image, flow, target
+
 
 class RandomBrightness(object):
     def __init__(self, delta=32):
         assert delta >= 0.0
         assert delta <= 255.0
         self.delta = delta
-    def __call__(self, image, target):
+
+    def __call__(self, image, flow, target):
         if rand.randint(2):
             delta = rand.uniform(-self.delta, self.delta)
             image += delta
-        return image, target
+        return image, flow, target
+
 
 class RandomSaturation(object):
     def __init__(self, lower=0.5, upper=1.5):
@@ -343,55 +356,62 @@ class RandomSaturation(object):
         assert self.upper >= self.lower, "contrast upper must be >= lower."
         assert self.lower >= 0, "contrast lower must be non-negative."
 
-    def __call__(self, image, target):
+    def __call__(self, image, flow, target):
         if rand.randint(2):
             image[:, :, 1] *= rand.uniform(self.lower, self.upper)
-        return image, target
+        return image, flow, target
 
-class RandomHue(object): #
+
+class RandomHue(object):  #
     def __init__(self, delta=18.0):
         assert delta >= 0.0 and delta <= 360.0
         self.delta = delta
 
-    def __call__(self, image, target):
+    def __call__(self, image, flow, target):
         if rand.randint(2):
             image[:, :, 0] += rand.uniform(-self.delta, self.delta)
             image[:, :, 0][image[:, :, 0] > 360.0] -= 360.0
             image[:, :, 0][image[:, :, 0] < 0.0] += 360.0
-        return image, target
+        return image, flow, target
+
 
 class RandomLightingNoise(object):
     def __init__(self):
         self.perms = ((0, 1, 2), (0, 2, 1),
                       (1, 0, 2), (1, 2, 0),
                       (2, 0, 1), (2, 1, 0))
-    def __call__(self, image, target):
+
+    def __call__(self, image, fl, target):
         if rand.randint(2):
             swap = self.perms[rand.randint(len(self.perms))]
             shuffle = SwapChannels(swap)  # shuffle channels
             image = shuffle(image)
-        return image, target
+        return image, fl, target
+
 
 class ConvertColor(object):
     def __init__(self, current='BGR', transform='HSV'):
         self.transform = transform
         self.current = current
 
-    def __call__(self, image, target):
+    def __call__(self, image, flow, target):
         if self.current == 'BGR' and self.transform == 'HSV':
             image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         elif self.current == 'HSV' and self.transform == 'BGR':
             image = cv2.cvtColor(image, cv2.COLOR_HSV2BGR)
         else:
             raise NotImplementedError
-        return image, target
+        return image, flow, target
+
 
 class SwapChannels(object):
     def __init__(self, swaps):
         self.swaps = swaps
+
     def __call__(self, image):
         image = image[:, :, self.swaps]
         return image
+
 
 class PhotometricDistort(object):
     def __init__(self):
@@ -405,62 +425,79 @@ class PhotometricDistort(object):
         ]
         self.rand_brightness = RandomBrightness()
         self.rand_light_noise = RandomLightingNoise()
-    
-    def __call__(self,clip,target):
-        imgs = []
-        for img in clip:
+
+    def __call__(self, clip, flow, target):
+        imgs, flows = [], []
+        for _, (img, fl) in enumerate(zip(clip, flow)):
             img = np.asarray(img).astype('float32')
-            img, target = self.rand_brightness(img, target)
+            fl = np.asarray(fl).astype('float32')
+            img, fl, target = self.rand_brightness(img, fl, target)
             if rand.randint(2):
                 distort = Compose(self.pd[:-1])
             else:
                 distort = Compose(self.pd[1:])
-            img, target = distort(img, target)
-            img, target = self.rand_light_noise(img, target)
+            img, fl, target = distort(img, fl, target)
+            img, fl, target = self.rand_light_noise(img, fl, target)
             imgs.append(Image.fromarray(img.astype('uint8')))
-        return imgs, target
+            flows.append(Image.fromarray(fl.astype('uint8')))
+        return imgs, flows, target
+
 
 # NOTICE: if used for mask, need to change
 class Expand(object):
     def __init__(self, mean):
         self.mean = mean
-    def __call__(self, clip, target):
+
+    def __call__(self, clip, flow, target):
         if rand.randint(2):
-            return clip,target
+            return clip, flow, target
+
         imgs = []
+        flows = []
         masks = []
         image = np.asarray(clip[0]).astype('float32')
         height, width, depth = image.shape
         ratio = rand.uniform(1, 4)
-        left = rand.uniform(0, width*ratio - width)
-        top = rand.uniform(0, height*ratio - height)
+        left = rand.uniform(0, width * ratio - width)
+        top = rand.uniform(0, height * ratio - height)
+
         for i in range(len(clip)):
             image = np.asarray(clip[i]).astype('float32')
-            expand_image = np.zeros((int(height*ratio), int(width*ratio), depth),dtype=image.dtype)
+            expand_image = np.zeros((int(height * ratio), int(width * ratio), depth), dtype=image.dtype)
             expand_image[:, :, :] = self.mean
-            expand_image[int(top):int(top + height),int(left):int(left + width)] = image
+            expand_image[int(top):int(top + height), int(left):int(left + width)] = image
             imgs.append(Image.fromarray(expand_image.astype('uint8')))
-            expand_mask = torch.zeros((int(height*ratio), int(width*ratio)),dtype=torch.uint8)
-            expand_mask[int(top):int(top + height),int(left):int(left + width)] = target['masks'][i]
+
+            flow_image = np.asarray(flow[i]).astype('float32')
+            expand_flow = np.zeros((int(height * ratio), int(width * ratio), flow_image.shape[2]),
+                                   dtype=flow_image.dtype)
+            expand_flow[int(top):int(top + height), int(left):int(left + width)] = flow_image
+            flows.append(expand_flow)
+
+            expand_mask = torch.zeros((int(height * ratio), int(width * ratio)), dtype=torch.uint8)
+            expand_mask[int(top):int(top + height), int(left):int(left + width)] = target['masks'][i]
             masks.append(expand_mask)
         boxes = target['boxes'].numpy()
         boxes[:, :2] += (int(left), int(top))
         boxes[:, 2:] += (int(left), int(top))
         target['boxes'] = torch.tensor(boxes)
-        target['masks']=torch.stack(masks)
-        return imgs, target
+        target['masks'] = torch.stack(masks)
+
+        return imgs, flows, target
+
 
 class RandomHorizontalFlip(object):
     def __init__(self, p=0.5):
         self.p = p
 
-    def __call__(self, img, target):
+    def __call__(self, img, flow, target):
         if random.random() < self.p:
             # NOTE: caption for 'left' and 'right' should also change
             caption = target['caption']
             target['caption'] = caption.replace('left', '@').replace('right', 'left').replace('@', 'right')
-            return hflip(img, target)
-        return img, target
+            return hflip(img, flow, target)
+        return img, flow, target
+
 
 class RandomVerticalFlip(object):
     def __init__(self, p=0.5):
@@ -478,9 +515,9 @@ class RandomResize(object):
         self.sizes = sizes
         self.max_size = max_size
 
-    def __call__(self, img, target=None):
+    def __call__(self, img, flow, target=None):
         size = random.choice(self.sizes)
-        return resize(img, target, size, self.max_size)
+        return resize(img, flow, target, size, self.max_size)
 
 
 class RandomPad(object):
@@ -498,23 +535,26 @@ class RandomSelect(object):
     Randomly selects between transforms1 and transforms2,
     with probability p for transforms1 and (1 - p) for transforms2
     """
+
     def __init__(self, transforms1, transforms2, p=0.5):
         self.transforms1 = transforms1
         self.transforms2 = transforms2
         self.p = p
 
-    def __call__(self, img, target):
+    def __call__(self, img, flow, target):
         if random.random() < self.p:
-            return self.transforms1(img, target)
-        return self.transforms2(img, target)
+            return self.transforms1(img, flow, target)
+        return self.transforms2(img, flow, target)
 
 
 class ToTensor(object):
-    def __call__(self, clip, target):
-        img = []
+    def __call__(self, clip, flows, target):
+        img, flow = [], []
         for im in clip:
             img.append(F.to_tensor(im))
-        return img, target
+        for fl in flows:
+            flow.append(F.to_tensor(fl))
+        return img, flow, target
 
 
 class RandomErasing(object):
@@ -527,16 +567,20 @@ class RandomErasing(object):
 
 
 class Normalize(object):
-    def __init__(self, mean, std):
+    def __init__(self, mean, std, flow_mean, flow_std):
         self.mean = mean
         self.std = std
+        self.flow_mean = flow_mean
+        self.flow_std = flow_std
 
-    def __call__(self, clip, target=None):
-        image = []
+    def __call__(self, clip, flow, target=None):
+        image, flows = [], []
         for im in clip:
             image.append(F.normalize(im, mean=self.mean, std=self.std))
+        for fl in flow:
+            flows.append(F.normalize(fl, mean=self.flow_mean, std=self.flow_std))
         if target is None:
-            return image, None
+            return image, flows, None
         target = target.copy()
         h, w = image[0].shape[-2:]
         if "boxes" in target:
@@ -544,17 +588,17 @@ class Normalize(object):
             boxes = box_xyxy_to_cxcywh(boxes)
             boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
-        return image, target
+        return image, flows, target
 
 
 class Compose(object):
     def __init__(self, transforms):
         self.transforms = transforms
 
-    def __call__(self, image, target):
+    def __call__(self, image, flow, target):
         for t in self.transforms:
-            image, target = t(image, target)
-        return image, target
+            image, flow, target = t(image, flow, target)
+        return image, flow, target
 
     def __repr__(self):
         format_string = self.__class__.__name__ + "("

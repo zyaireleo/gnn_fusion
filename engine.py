@@ -3,6 +3,9 @@ Train and eval functions used in main.py
 Modified from DETR (https://github.com/facebookresearch/detr)
 """
 import math
+
+from torch.cuda.amp import GradScaler
+
 from models import postprocessors
 import os
 import sys
@@ -17,7 +20,13 @@ from datasets.refexp_eval import RefExpEvaluator
 
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
+from torch import autocast
+
+import util.misc as utils
 from datasets.a2d_eval import calculate_precision_at_k_and_iou_metrics, calculate_bbox_precision_at_k_and_iou_metrics
+from datasets.coco_eval import CocoEvaluator
+from datasets.refexp_eval import RefExpEvaluator
+
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
@@ -28,13 +37,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        samples = samples.to(device)
-        captions = [t["caption"] for t in targets]
-        targets = utils.targets_to(targets, device) 
+        # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
 
-        outputs = model(samples, captions, targets) 
-        loss_dict = criterion(outputs, targets)
+    for samples, flows, targets in metric_logger.log_every(data_loader, print_freq, header):
+        samples, flows = samples.to(device), flows.to(device)
+        captions = [t["caption"] for t in targets]
+        targets = utils.targets_to(targets, device)
+        with autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+            outputs = model(samples, flows, captions, targets)
+            loss_dict = criterion(outputs, targets)
 
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -53,13 +65,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             print("Loss is {}, stopping training".format(loss_value))
             print(loss_dict_reduced)
             sys.exit(1)
+
         optimizer.zero_grad()
-        losses.backward()
+        scaler.scale(losses).backward()
         if max_norm > 0:
             grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
             grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
@@ -80,13 +94,14 @@ def evaluate(model, criterion, postprocessors, data_loader, evaluator_list, devi
     header = 'Test:'
 
     predictions = []
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for samples, flows, targets in metric_logger.log_every(data_loader, 10, header):
         dataset_name = targets[0]["dataset_name"]
+        flows = flows.to(device)
         samples = samples.to(device)
         captions = [t["caption"] for t in targets]
         targets = utils.targets_to(targets, device)
 
-        outputs = model(samples, captions, targets)
+        outputs = model(samples, flows, captions, targets)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -106,19 +121,18 @@ def evaluate(model, criterion, postprocessors, data_loader, evaluator_list, devi
             target_sizes = torch.stack([t["size"] for t in targets], dim=0)
             results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
         res = {target['image_id'].item(): output for target, output in zip(targets, results)}
-        
+
         for evaluator in evaluator_list:
             evaluator.update(res)
 
         # REC & RES predictions
         for p, target in zip(results, targets):
             for s, b, m in zip(p['scores'], p['boxes'], p['rle_masks']):
-                    predictions.append({'image_id': target['image_id'].item(),
-                                        'category_id': 1,  # dummy label, as categories are not predicted in ref-vos
-                                        'bbox': b.tolist(),
-                                        'segmentation': m,
-                                        'score': s.item()})
-
+                predictions.append({'image_id': target['image_id'].item(),
+                                    'category_id': 1,  # dummy label, as categories are not predicted in ref-vos
+                                    'bbox': b.tolist(),
+                                    'segmentation': m,
+                                    'score': s.item()})
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -182,7 +196,7 @@ def evaluate(model, criterion, postprocessors, data_loader, evaluator_list, devi
         eval_metrics.update({'segm overall_iou': overall_iou, 'segm mean_iou': mean_iou})
         print(eval_metrics)
         stats.update(eval_metrics)
-        
+
     return stats
 
 
@@ -193,14 +207,15 @@ def evaluate_a2d(model, data_loader, postprocessor, device, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for samples, flows, targets in metric_logger.log_every(data_loader, 10, header):
         image_ids = [t['image_id'] for t in targets]
 
         samples = samples.to(device)
+        flows = flows.to(device)
         captions = [t["caption"] for t in targets]
         targets = utils.targets_to(targets, device)
 
-        outputs = model(samples, captions, targets)
+        outputs = model(samples, flows, captions, targets)
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         target_sizes = torch.stack([t["size"] for t in targets], dim=0)
@@ -208,11 +223,11 @@ def evaluate_a2d(model, data_loader, postprocessor, device, args):
 
         for p, image_id in zip(processed_outputs, image_ids):
             for s, m in zip(p['scores'], p['rle_masks']):
-                    predictions.append({'image_id': image_id,
-                                        'category_id': 1,  # dummy label, as categories are not predicted in ref-vos
-                                        'segmentation': m,
-                                        'score': s.item()})
-    
+                predictions.append({'image_id': image_id,
+                                    'category_id': 1,  # dummy label, as categories are not predicted in ref-vos
+                                    'segmentation': m,
+                                    'score': s.item()})
+
     # gather and merge predictions from all gpus
     gathered_pred_lists = utils.all_gather(predictions)
     predictions = [p for p_list in gathered_pred_lists for p in p_list]

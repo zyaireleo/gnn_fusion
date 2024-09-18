@@ -63,6 +63,7 @@ class BackboneBase(nn.Module):
         for name, parameter in backbone.named_parameters():
             if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
                 parameter.requires_grad_(False)
+                print('backbone parameters frozen', )
         if return_interm_layers:
             return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
             # return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"} deformable detr
@@ -79,14 +80,17 @@ class BackboneBase(nn.Module):
         out: Dict[str, NestedTensor] = {}
         for name, x in xs.items():
             m = tensor_list.mask
-            assert m is not None
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+            if m is not None:
+                mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
+            else:
+                mask = None
             out[name] = NestedTensor(x, mask)
         return out
 
 
 class Backbone(BackboneBase):
     """ResNet backbone with frozen BatchNorm."""
+
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
@@ -106,10 +110,11 @@ class Joiner(nn.Sequential):
         self.strides = backbone.strides
         self.num_channels = backbone.num_channels
 
-
     def forward(self, tensor_list: NestedTensor):
         tensor_list.tensors = rearrange(tensor_list.tensors, 'b t c h w -> (b t) c h w')
-        tensor_list.mask = rearrange(tensor_list.mask, 'b t h w -> (b t) h w')
+
+        if tensor_list.mask is not None:
+            tensor_list.mask = rearrange(tensor_list.mask, 'b t h w -> (b t) h w')
 
         xs = self[0](tensor_list)
         out: List[NestedTensor] = []
@@ -125,8 +130,12 @@ def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
     return_interm_layers = args.masks or (args.num)
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
-    model = Joiner(backbone, position_embedding)
-    model.num_channels = backbone.num_channels
-    return model
+    vision = Backbone(args.vision_backbone, train_backbone, return_interm_layers, args.dilation)
+    vision_backbone = Joiner(vision, position_embedding)
+    vision_backbone.num_channels = vision.num_channels
 
+    motion = Backbone(args.vision_backbone, train_backbone, return_interm_layers, args.dilation)
+    motion_backbone = Joiner(motion, position_embedding)
+    motion_backbone.num_channels = motion.num_channels
+
+    return vision_backbone, motion_backbone

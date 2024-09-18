@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -x
 
-GPUS=${GPUS:-8}
+module load anaconda
+module load cuda/12.1
+module load gcc
+module list
+source activate foundmental
+
+GPUS=${GPUS:-4}
 PORT=${PORT:-29500}
 if [ $GPUS -lt 8 ]; then
     GPUS_PER_NODE=${GPUS_PER_NODE:-$GPUS}
@@ -10,7 +16,7 @@ else
 fi
 CPUS_PER_TASK=${CPUS_PER_TASK:-5}
 
-OUTPUT_DIR=$1
+OUTPUT_DIR=${1:-'./output'}
 PY_ARGS=${@:2}  # Any other arguments 
 
 # train

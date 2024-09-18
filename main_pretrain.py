@@ -1,27 +1,27 @@
 import argparse
 import datetime
 import json
+import os
 import random
 import time
-from pathlib import Path
 from collections import namedtuple
-from functools import partial
+from pathlib import Path
 
-import os
+import GPUtil
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data import DataLoader
 
-import util.misc as utils
 import datasets.samplers as samplers
-from datasets.coco_eval import CocoEvaluator
+import opts
+import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
+from datasets.coco_eval import CocoEvaluator
 from engine import evaluate, train_one_epoch
 from models import build_model
 from models.postprocessors import build_postprocessors
-
-import opts
-
 
 
 def main(args):
@@ -38,7 +38,7 @@ def main(args):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
+    seed = args.seed
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -48,7 +48,7 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -69,20 +69,24 @@ def main(args):
         {
             "params":
                 [p for n, p in model_without_ddp.named_parameters()
-                 if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n, args.lr_text_encoder_names) 
+                 if not match_name_keywords(n, args.lr_backbone_names) and not match_name_keywords(n,
+                                                                                                   args.lr_text_encoder_names)
                  and not match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
             "lr": args.lr,
         },
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if
+                       match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
             "lr": args.lr_backbone,
         },
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_text_encoder_names) and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if
+                       match_name_keywords(n, args.lr_text_encoder_names) and p.requires_grad],
             "lr": args.lr_text_encoder,
         },
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if
+                       match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
             "lr": args.lr * args.lr_linear_proj_mult,
         }
     ]
@@ -112,7 +116,7 @@ def main(args):
 
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
-
+    print("Batch sampler train: ", len(batch_sampler_train))
     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
                                    collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                    pin_memory=True)
@@ -128,7 +132,9 @@ def main(args):
     for name in dataset_names:
         dataset_val = build_dataset(name, image_set="val", args=args)
         sampler_val = (
-            samplers.DistributedSampler(dataset_val, shuffle=False) if args.distributed else torch.utils.data.SequentialSampler(dataset_val)
+            samplers.DistributedSampler(dataset_val,
+                                        shuffle=False) if args.distributed else torch.utils.data.SequentialSampler(
+                dataset_val)
         )
         data_loader_val = DataLoader(
             dataset_val,
@@ -152,8 +158,6 @@ def main(args):
         evaluator_list.append(CocoEvaluator(base_ds, tuple(iou_types), useCats=False))
         # TODO: currently ont support RefExpEvaluator (memory error)
         return evaluator_list
-
-
 
     output_dir = Path(args.output_dir)
     if args.resume:
@@ -181,7 +185,8 @@ def main(args):
             # todo: this is a hack for doing experiment that resume from checkpoint and also modify lr scheduler (e.g., decrease lr in advance).
             args.override_resumed_lr_drop = True
             if args.override_resumed_lr_drop:
-                print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
+                print(
+                    'Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
                 lr_scheduler.step_size = args.lr_drop
                 lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
             lr_scheduler.step(lr_scheduler.last_epoch)
@@ -210,7 +215,6 @@ def main(args):
             }
             print(log_stats)
 
-
     if args.eval:
         print("Evaluating......")
         test_stats = {}
@@ -229,7 +233,7 @@ def main(args):
                 args=args,
             )
             test_stats.update({item.dataset_name + "_" + k: v for k, v in curr_test_stats.items()})
-        
+
         log_stats = {
             **{f"test_{k}": v for k, v in test_stats.items()},
             "n_parameters": n_parameters,
@@ -238,67 +242,92 @@ def main(args):
 
         return
 
-
     print("Start training")
+    monitor_process = mp.Process(target=monitor_gpu)
+    monitor_process.start()
+
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
-        lr_scheduler.step()
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every epochs
-            # if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 1 == 0:
-            if (epoch + 1) % 1 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
+            train_stats = train_one_epoch(
+                model, criterion, data_loader_train, optimizer, device, epoch,
+                args.clip_max_norm)
+            lr_scheduler.step()
+            if args.output_dir:
+                checkpoint_paths = [output_dir / 'checkpoint.pth']
+                # extra checkpoint before LR drop and every epochs
+                # if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 1 == 0:
+                if (epoch + 1) % 1 == 0:
+                    checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        'args': args,
+                    }, checkpoint_path)
 
-        test_stats = {}
-        for i, item in enumerate(val_tuples):
-            evaluator_list = build_evaluator_list(item.base_ds, item.dataset_name)
-            postprocessors = build_postprocessors(args, item.dataset_name)
-            item = item._replace(evaluator_list=evaluator_list)
-            print(f"Evaluating {item.dataset_name}")
-            curr_test_stats = evaluate(
-                model=model,
-                criterion=criterion,
-                postprocessors=postprocessors,
-                data_loader=item.dataloader,
-                evaluator_list=item.evaluator_list,
-                device=device,
-                args=args,
-            )
-            test_stats.update({item.dataset_name + "_" + k: v for k, v in curr_test_stats.items()})
+            test_stats = {}
+            for i, item in enumerate(val_tuples):
+                evaluator_list = build_evaluator_list(item.base_ds, item.dataset_name)
+                postprocessors = build_postprocessors(args, item.dataset_name)
+                item = item._replace(evaluator_list=evaluator_list)
+                print(f"Evaluating {item.dataset_name}")
+                curr_test_stats = evaluate(
+                    model=model,
+                    criterion=criterion,
+                    postprocessors=postprocessors,
+                    data_loader=item.dataloader,
+                    evaluator_list=item.evaluator_list,
+                    device=device,
+                    args=args,
+                )
+                test_stats.update({item.dataset_name + "_" + k: v for k, v in curr_test_stats.items()})
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                         **{f'test_{k}': v for k, v in test_stats.items()},
+                         'epoch': epoch,
+                         'n_parameters': n_parameters}
 
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
+            if args.output_dir and utils.is_main_process():
+                with (output_dir / "log.txt").open("a") as f:
+                    f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print(f'Training time {total_time_str}')
+    cleanup()
+    monitor_process.terminate()
+    monitor_process.join()
+
+
+def monitor_gpu(interval=60 * 2):
+    while True:
+        gpus = GPUtil.getGPUs()
+        for gpu in gpus:
+            print(f"GPU {gpu.id}: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB")
+        time.sleep(interval)
+    # pass
+
+
+def setup():
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    return rank, world_size
+
+
+def cleanup():
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('ReferFormer pretrain training and evaluation script', parents=[opts.get_args_parser()])
+    parser = argparse.ArgumentParser('ReferFormer pretrain training and evaluation script',
+                                     parents=[opts.get_args_parser()])
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
-

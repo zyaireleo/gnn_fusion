@@ -6,11 +6,13 @@ Modified from DETR (https://github.com/facebookresearch/detr)
 import copy
 import math
 import os
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from torch import nn
+from torch import nn, Tensor
+from torch.nn.functional import dropout
 from transformers import RobertaModel, RobertaTokenizerFast
 
 from util.misc import (NestedTensor, nested_tensor_from_videos_list,
@@ -20,6 +22,7 @@ from .criterion import SetCriterion
 from .deformable_transformer import build_deforamble_transformer
 from .gnn_fusion_raw import MultimodalGNN
 from .matcher import build_matcher
+from .mti import MTI
 from .position_encoding import PositionEmbeddingSine1D
 from .postprocessors import build_postprocessors
 from .segmentation import CrossModalFPNDecoder, VisionLanguageFusionModule
@@ -30,6 +33,56 @@ def _get_clones(module, N):
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
+
+
+def _get_activation_fn(activation):
+    """Return an activation function given a string"""
+    if activation == "relu":
+        return F.relu
+    if activation == "gelu":
+        return F.gelu
+    if activation == "glu":
+        return F.glu
+    raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
+
+
+class AttentionLayer(nn.Module):
+
+    def __init__(self, d_model, nhead, dropout=0.0,
+                 activation="relu", normalize_before=False):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+        self.normalize_before = normalize_before
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward(self, tgt, memory,
+                memory_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm(tgt)
+
+        return tgt
 
 
 class ReferFormer(nn.Module):
@@ -168,7 +221,7 @@ class ReferFormer(nn.Module):
         )
 
         self.fusion_module = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
-        self.modality_fusion = MultimodalGNN(256, 6, 4)
+        self.modality_fusion = MultimodalGNN(256, 7, 4)
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
 
         # Build FPN Decoder
@@ -207,6 +260,12 @@ class ReferFormer(nn.Module):
         for layer in self.controller.layers:
             nn.init.zeros_(layer.bias)
             nn.init.xavier_uniform_(layer.weight)
+
+        self.mti = MTI(input_dim=hidden_dim, window_size=4, num_frame_queries=num_queries,
+                       num_queries=num_queries, nheads=8, dim_feedforward=2048,
+                       enc_layers=3, dec_layers=3)
+
+        self.self_att = AttentionLayer(hidden_dim, 8)
 
     def forward(self, samples, flows, captions, targets):
         """The forward expects a NestedTensor, which consists of:
@@ -263,6 +322,7 @@ class ReferFormer(nn.Module):
         srcs = []
         masks = []
         poses = []
+        global_x = []
 
         text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
         text_word_features, text_word_masks = text_features.decompose()
@@ -293,11 +353,13 @@ class ReferFormer(nn.Module):
 
             text_feat = text_word_features.permute(1, 2, 0).contiguous()
             text_feat_pos = text_pos.permute(1, 2, 0).contiguous()
-            src_proj_l = self.modality_fusion(((src_proj_l, v_pos), (m_proj_l, m_pos), (text_feat, text_feat_pos)))[0]
+            src_proj_l, global_x_i = self.modality_fusion(
+                ((src_proj_l, v_pos), (m_proj_l, m_pos), (text_feat, text_feat_pos)))
 
             srcs.append(src_proj_l)
             masks.append(mask)
             poses.append(pos_l)
+            global_x.append(global_x_i)
             assert mask is not None
 
         if self.num_feature_levels > (len(features) - 1):
@@ -334,22 +396,41 @@ class ReferFormer(nn.Module):
 
                 text_feat = text_word_features.permute(1, 2, 0).contiguous()
                 text_feat_pos = text_pos.permute(1, 2, 0).contiguous()
-                src = self.modality_fusion(((src, v_pos), (m_feat, m_pos), (text_feat, text_feat_pos)))[0]
+                src, global_x_i = self.modality_fusion(((src, v_pos), (m_feat, m_pos), (text_feat, text_feat_pos)))
 
                 srcs.append(src)
                 assert not torch.isnan(src).any(), f"src contains NaN: {src},lvl: {l}"
                 masks.append(mask)
                 poses.append(pos_l)
+                global_x.append(global_x_i)
 
         # Transformer
         query_embeds = self.query_embed.weight  # [num_queries, c]
+        x_flatten = []  # (\sigma h*w b  c)
+        for lvl, x in enumerate(global_x):
+            # x :(b c h w)
+            x = x.flatten(2).permute(2, 0, 1).contiguous()
+            x_flatten.append(x)
+        x_flatten = torch.cat(x_flatten, dim=0)
+
         text_embed = repeat(text_sentence_features, 'b c -> b t q c', t=t, q=self.num_queries)
+        text_embed = rearrange(text_embed, 'b t q c -> (t q) b c')
+        text_embed = self.self_att(tgt=text_embed, memory=x_flatten)
+
+        text_embed = rearrange(text_embed, '(q t) b c -> b t q c', t=t)
         hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, inter_samples = \
             self.transformer(srcs, text_embed, masks, poses, query_embeds)
         # hs: [l, batch_size*time, num_queries_per_frame, c]
         # memory: list[Tensor], shape of tensor is [batch_size*time, c, hi, wi]
         # init_reference: [batch_size*time, num_queries_per_frame, 2]
         # inter_references: [l, batch_size*time, num_queries_per_frame, 4]
+
+        hsl, hsbt, hsq, hsc = hs.shape
+
+        mti_hs_box = hs.reshape(hsl, b, t, hsq, hsc).permute(0, 2, 1, 3, 4).contiguous()
+        mti_hs = self.mti(mti_hs_box)  # [l, t,b, q, c]
+
+        hs = mti_hs.repeat(1, t, 1, 1)
 
         out = {}
         # prediction

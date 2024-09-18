@@ -8,7 +8,7 @@ import pickle
 import json
 
 
-def convert_to_coco(data_root='data/coco', output_root='data/coco', dataset='refcoco', dataset_split='unc'):
+def convert_to_coco(data_root='../data/coco', output_root='../data/coco', dataset='refcoco', dataset_split='unc'):
     dataset_dir = os.path.join(data_root, dataset)
     output_dir = os.path.join(output_root, dataset) # .json save path
     if not os.path.exists(output_dir):

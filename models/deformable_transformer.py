@@ -8,25 +8,24 @@
 # ------------------------------------------------------------------------
 
 import copy
-from typing import Optional, List
 import math
 
 import torch
 import torch.nn.functional as F
-from torch import nn, Tensor
-from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
-
-from util.misc import inverse_sigmoid
-from models.ops.modules import MSDeformAttn
-
 from einops import rearrange
+from torch import nn, Tensor, autocast
+from torch.nn.init import xavier_uniform_, constant_, normal_
+from torch_geometric.nn import RGCNConv, GATv2Conv
+
+from models.ops.modules import MSDeformAttn
+from util.misc import inverse_sigmoid
 
 
 class DeformableTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8,
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024, dropout=0.1,
                  activation="relu", return_intermediate_dec=False,
-                 num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
+                 num_feature_levels=4, dec_n_points=4, enc_n_points=4,
                  two_stage=False, two_stage_num_proposals=300):
         super().__init__()
 
@@ -45,7 +44,7 @@ class DeformableTransformer(nn.Module):
 
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
-                                                          num_feature_levels, 
+                                                          num_feature_levels,
                                                           nhead, dec_n_points)
         self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
 
@@ -57,9 +56,11 @@ class DeformableTransformer(nn.Module):
             self.pos_trans = nn.Linear(d_model * 2, d_model * 2)
             self.pos_trans_norm = nn.LayerNorm(d_model * 2)
         else:
-            self.reference_points = nn.Linear(d_model, 2) # reference point here (x, y)
+            self.reference_points = nn.Linear(d_model, 2)  # reference point here (x, y)
 
         self._reset_parameters()
+        self.rgcn_conv = RGCNConv(256, 256, 2)
+        self.agt_conv = GATv2Conv(256, 256, concat=False)
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -148,29 +149,32 @@ class DeformableTransformer(nn.Module):
             spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
 
-            src = src.flatten(2).transpose(1, 2) # [batch_size, hi*wi, c]
-            mask = mask.flatten(1)               # [batch_size, hi*wi]
-            pos_embed = pos_embed.flatten(2).transpose(1, 2) # [batch_size, hi*wi, c]
+            src = src.flatten(2).transpose(1, 2)  # [batch_size, hi*wi, c]
+            mask = mask.flatten(1)  # [batch_size, hi*wi]
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)  # [batch_size, hi*wi, c]
             lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
 
             lvl_pos_embed_flatten.append(lvl_pos_embed)
+
             src_flatten.append(src)
             mask_flatten.append(mask)
 
         # For a clip, concat all the features, first fpn layer size, then frame size
-        src_flatten = torch.cat(src_flatten, 1)     # [bs*t, \sigma(hi*wi), c] 
-        mask_flatten = torch.cat(mask_flatten, 1)   # [bs*t, \sigma(hi*wi)]
-        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) 
-        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
-        level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
-        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
+        src_flatten = torch.cat(src_flatten, 1)  # [bs*t, \sigma(hi*wi), c]
+        mask_flatten = torch.cat(mask_flatten, 1)  # [bs*t, \sigma(hi*wi)]
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long,
+                                         device=src_flatten.device)  # torch.Size([4, 2])
+        level_start_index = torch.cat(
+            (spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))  # tensor([   0, 3840, 4800, 5040])
+        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)  # torch.Size([5, 4, 2])
 
         # encoder
         # memory: [bs*t, \sigma(hi*wi), c]
         memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
 
         # prepare input for decoder
-        bs, _, c = memory.shape 
+        bs, _, c = memory.shape
         if self.two_stage:
             output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
 
@@ -187,15 +191,32 @@ class DeformableTransformer(nn.Module):
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
         else:
-            b, t, q, c = tgt.shape
-            tgt = rearrange(tgt, 'b t q c -> (b t) q c')
-            query_embed = query_embed.unsqueeze(0).expand(b*t, -1, -1)      # [batch_size*time, num_queries_per_frame, c]
-            reference_points = self.reference_points(query_embed).sigmoid() # [batch_size*time, num_queries_per_frame, 2]
-            init_reference_out = reference_points
+            b, t, q, c = tgt.shape  # tgt torch.Size([1, 5, 5, 256])
+
+            tgt = rearrange(tgt, 'b t q c -> (b t) q c')  # tgt torch.Size([ 5, 5, 256])
+
+            query_embed = query_embed.unsqueeze(0).expand(b * t, -1,
+                                                          -1)  # [batch_size*time, num_queries_per_frame, c] :torch.Size([5，5, 256])
+            device = query_embed.device
+            edge_index, edge_type = initialize_edges_and_types(b, t, 5, device)
+            edge_index = edge_index.to(device)
+            edge_type = edge_type.to(device)
+
+            out = query_embed.reshape(-1, 256).contiguous()
+            out = self.rgcn_conv(out, edge_index, edge_type)
+            out = self.agt_conv(out, edge_index)
+            query_embed = out.reshape(b * t, q, -1).contiguous()
+
+            reference_points = self.reference_points(
+                query_embed).sigmoid()  # [batch_size*time, num_queries_per_frame, 2]
+            init_reference_out = reference_points  # [5,5,2]
 
         # decoder
         hs, inter_references, inter_samples = self.decoder(tgt, reference_points, memory,
-                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
+                                                               spatial_shapes, level_start_index, valid_ratios,
+                                                               query_embed,
+                                                               mask_flatten)
+        # [4,5,5,256] [4,5,5,2] [4,1,5,30,2]
 
         inter_references_out = inter_references
 
@@ -205,17 +226,19 @@ class DeformableTransformer(nn.Module):
         for lvl in range(self.num_feature_level - 1):
             h, w = spatial_shapes[lvl]
             # [bs*t, c, h, w]
-            memory_lvl = memory[:, spatial_index : spatial_index + h * w, :].reshape(bs, h, w, c).permute(0, 3, 1, 2).contiguous()  
+            memory_lvl = (memory[:, spatial_index: spatial_index + h * w, :].reshape(bs, h, w, c).permute(0, 3, 1, 2)
+                          .contiguous())
             memory_features.append(memory_lvl)
             spatial_index += h * w
 
         if self.two_stage:
             return hs, memory_features, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, inter_samples
-        # hs: [l, batch_size*time, num_queries_per_frame, c], where l is number of decoder layers
-        # init_reference_out: [batch_size*time, num_queries_per_frame, 2]
-        # inter_references_out: [l, batch_size*time, num_queries_per_frame, 4]
-        # memory: [batch_size*time, \sigma(hi*wi), c]
+        # hs: [l, batch_size*time, num_queries_per_frame, c], where l is number of decoder layers(default to 4)[4,5,5,256]
+        # init_reference_out: [batch_size*time, num_queries_per_frame, 2] [5,5,2]
+        # inter_references_out: [l, batch_size*time, num_queries_per_frame, 4] [4,5,5,4]
+        # memory: [batch_size*time, \sigma(hi*wi), c] [5,5100,256]
         # memory_features: list[Tensor]
+        # inter_samples: [4,1, 5, 30, 2]
 
         return hs, memory_features, init_reference_out, inter_references_out, None, None, inter_samples
 
@@ -252,8 +275,10 @@ class DeformableTransformerEncoderLayer(nn.Module):
 
     def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, padding_mask=None):
         # self attention
-        src2, sampling_locations, attention_weights = self.self_attn(self.with_pos_embed(src, pos), reference_points, 
-                                                                src, spatial_shapes, level_start_index, padding_mask)
+        src2, sampling_locations, attention_weights = self.self_attn(self.with_pos_embed(src, pos), reference_points,
+                                                                     src, spatial_shapes, level_start_index,
+                                                                     padding_mask)
+
         src = src + self.dropout1(src2)
         src = self.norm1(src)
 
@@ -273,7 +298,6 @@ class DeformableTransformerEncoder(nn.Module):
     def get_reference_points(spatial_shapes, valid_ratios, device):
         reference_points_list = []
         for lvl, (H_, W_) in enumerate(spatial_shapes):
-
             ref_y, ref_x = torch.meshgrid(torch.linspace(0.5, H_ - 0.5, H_, dtype=torch.float32, device=device),
                                           torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)
@@ -285,12 +309,19 @@ class DeformableTransformerEncoder(nn.Module):
         return reference_points
 
     def forward(self, src, spatial_shapes, level_start_index, valid_ratios, pos=None, padding_mask=None):
-        output = src
+        output = src  # torch.Size([5, 5100, 256])
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
-        for _, layer in enumerate(self.layers):
-            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
+        # torch.Size([5, 5100, 4, 2])
+        output = output.float()
+        pos = pos.float()
+        with autocast(device_type='cuda',enabled=False):
 
-        return output
+            for _, layer in enumerate(self.layers):
+                output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
+                # output: torch.Size([5, 5100, 256]), pos: torch.Size([5, 5100, 256]), reference_points: torch.Size([5, 5100, 4, 2]),spatial_shapes: torch.Size([4, 2]),
+                # level_start_index: tensor([   0, 3840, 4800, 5040]),padding_mask: torch.Size([5, 5100])
+
+            return output
 
 
 class DeformableTransformerDecoderLayer(nn.Module):
@@ -327,7 +358,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None):
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
+                src_padding_mask=None):
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
@@ -335,17 +367,22 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm2(tgt)
 
         # cross attention
-        tgt2, sampling_locations, attention_weights = self.cross_attn(self.with_pos_embed(tgt, query_pos),
-                               reference_points,
-                               src, src_spatial_shapes, level_start_index, src_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
+        with autocast(device_type='cuda',enabled=False):
+            tgt = tgt.float()
+            query_pos = query_pos.float()
+            src = src.float()
+            tgt2, sampling_locations, attention_weights = self.cross_attn(self.with_pos_embed(tgt, query_pos),
+                                                                          reference_points,
+                                                                          src, src_spatial_shapes, level_start_index,
+                                                                          src_padding_mask)
+            tgt = tgt + self.dropout1(tgt2)
+            tgt = self.norm1(tgt)
 
-        # ffn
-        tgt = self.forward_ffn(tgt)
+            # ffn
+            tgt = self.forward_ffn(tgt)
+            assert not torch.isnan(tgt).any(), f"tgt contains NaN: {tgt}"
 
-        return tgt, sampling_locations, attention_weights
-
+            return tgt, sampling_locations, attention_weights
 
 
 class DeformableTransformerDecoder(nn.Module):
@@ -365,27 +402,32 @@ class DeformableTransformerDecoder(nn.Module):
 
         intermediate = []
         intermediate_reference_points = []
-        intermediate_samples = [] # sample points
+        intermediate_samples = []  # sample points
         for lid, layer in enumerate(self.layers):
             if reference_points.shape[-1] == 4:
                 reference_points_input = reference_points[:, :, None] \
                                          * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None]
             else:
                 assert reference_points.shape[-1] == 2
-                reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            output, sampling_locations, attention_weights = layer(output, query_pos, reference_points_input, 
-                                                        src, src_spatial_shapes, src_level_start_index, src_padding_mask)
+                # reference_points:[5,5,1,2]   src_valid_ratios:[5, 1,4, 2]
+                reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]  # [5,5,4,2]
+            output, sampling_locations, attention_weights = layer(output, query_pos, reference_points_input,
+                                                                  src, src_spatial_shapes, src_level_start_index,
+                                                                  src_padding_mask)
 
-            # sampling_loactions: [N, Len_q, self.n_heads, self.n_levels, self.n_points, 2], 
+            assert not torch.isnan(output).any(), f"Reference contains NaN: {output}"
+
+            # sampling_loactions: [N, Len_q, self.n_heads, self.n_levels, self.n_points, 2],
+            # output: [5,5,256]
             #                     [B, Q, n_head, n_level(num_feature_level*num_frames), n_points, 2]
             # attention_weights: [B, Q, n_head, n_level(num_feature_level*num_frames), n_points]
             # src_valid_ratios: [N, self.n_levels, 2]
             N, Len_q = sampling_locations.shape[:2]
             sampling_locations = sampling_locations / src_valid_ratios[:, None, None, :, None, :]
-            weights_flat = attention_weights.view(N, Len_q, -1)      # [B, Q, n_head * n_level * n_points]
+            weights_flat = attention_weights.view(N, Len_q, -1)  # [B, Q, n_head * n_level * n_points]
             samples_flat = sampling_locations.view(N, Len_q, -1, 2)  # [B, Q, n_head * n_level * n_points, 2]
-            top_weights, top_idx = weights_flat.topk(30, dim=2)      # [B, Q, 30], [B, Q, 30]
-            weights_keep = torch.gather(weights_flat, 2, top_idx)    # [B, Q, 30]
+            top_weights, top_idx = weights_flat.topk(30, dim=2)  # [B, Q, 30], [B, Q, 30]
+            weights_keep = torch.gather(weights_flat, 2, top_idx)  # [B, Q, 30]
             samples_keep = torch.gather(samples_flat, 2, top_idx.unsqueeze(-1).repeat(1, 1, 1, 2))  # [B, Q, 30, 2]
 
             # hack implementation for iterative bounding box refinement
@@ -401,13 +443,14 @@ class DeformableTransformerDecoder(nn.Module):
                     new_reference_points = new_reference_points.sigmoid()
                 reference_points = new_reference_points.detach()
 
-            if self.return_intermediate:
+            if self.return_intermediate:  # True
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
                 intermediate_samples.append(samples_keep)
 
-        if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_reference_points), torch.stack(intermediate_samples)
+        if self.return_intermediate:  # true
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points), torch.stack(
+                intermediate_samples)  # output: [4,5,5,256] [4,5,5,2] [4,1,5,30,2]
 
         return output, reference_points, samples_keep
 
@@ -427,6 +470,41 @@ def _get_activation_fn(activation):
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
 
 
+def initialize_edges_and_types(batch_size: int, num_frames: int, num_queries_per_frame: int, device: str) -> (
+        Tensor, Tensor):
+    # 每帧query间有5*4=20条边，总共100条
+    # 每帧间对应query有5条边，总共20条
+    edge_index = []
+    edge_type = []
+
+    for batch in range(batch_size):
+        start_idx = batch * num_frames * num_queries_per_frame
+
+        # 每个帧内的双向边
+        for frame in range(num_frames):
+            frame_start_idx = start_idx + frame * num_queries_per_frame
+            for i in range(num_queries_per_frame):
+                for j in range(i + 1, num_queries_per_frame):
+                    edge_index.append([frame_start_idx + i, frame_start_idx + j])
+                    edge_type.append(0)
+                    edge_index.append([frame_start_idx + j, frame_start_idx + i])
+                    edge_type.append(0)
+
+        # 不同帧间的单向边
+        for frame in range(num_frames - 1):
+            frame_start_idx = start_idx + frame * num_queries_per_frame
+            next_frame_start_idx = frame_start_idx + num_queries_per_frame
+            for i in range(num_queries_per_frame):
+                edge_index.append([frame_start_idx + i, next_frame_start_idx + i])
+                edge_type.append(1)
+
+    edge_index = torch.tensor(edge_index, dtype=torch.long, device=device).t().contiguous()
+    edge_type = (torch.tensor(edge_type, dtype=torch.long, device=device)
+                 .view(-1).contiguous())  # ensure edge_type is a flat tensor
+
+    return edge_index, edge_type
+
+
 def build_deforamble_transformer(args):
     return DeformableTransformer(
         d_model=args.hidden_dim,
@@ -442,3 +520,14 @@ def build_deforamble_transformer(args):
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
         two_stage_num_proposals=args.num_queries)
+
+
+if __name__ == '__main__':
+    edge_index, edge_type = initialize_edges_and_types(1, 1, 5, 'cpu')
+    rgcn_conv = RGCNConv(256, 256, 2)
+    gat_conve = GATv2Conv(256, 256, 4, concat=False)
+    out = rgcn_conv(torch.rand((25, 256)), edge_index, edge_type)
+    out = gat_conve(out, edge_index)
+    print(out.shape)
+
+    print(edge_index, edge_type)

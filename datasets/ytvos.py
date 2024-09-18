@@ -1,19 +1,17 @@
 """
 Ref-YoutubeVOS data loader
 """
+import json
+import os
+import random
 from pathlib import Path
 
-import torch
-from torch.autograd.grad_mode import F
-from torch.utils.data import Dataset
-import datasets.transforms_video as T
-
-import os
-from PIL import Image
-import json
 import numpy as np
-import random
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
 
+import datasets.transforms_video as T
 from datasets.categories import ytvos_category_dict as category_dict
 
 
@@ -32,29 +30,30 @@ class YTVOSDataset(Dataset):
     annotations were publicly released only for the 'train' subset of the competition.
 
     """
-    def __init__(self, img_folder: Path, ann_file: Path, transforms, return_masks: bool, 
+
+    def __init__(self, img_folder: Path, ann_file: Path, transforms, return_masks: bool,
                  num_frames: int, max_skip: int):
-        self.img_folder = img_folder     
-        self.ann_file = ann_file         
-        self._transforms = transforms    
-        self.return_masks = return_masks # not used
-        self.num_frames = num_frames     
+        self.img_folder = img_folder
+        self.ann_file = ann_file
+        self._transforms = transforms
+        self.return_masks = return_masks  # not used
+        self.num_frames = num_frames
         self.max_skip = max_skip
         # create video meta data
-        self.prepare_metas()       
+        self.prepare_metas()
 
-        print('\n video num: ', len(self.videos), ' clip num: ', len(self.metas))  
-        print('\n')    
+        print('\n video num: ', len(self.videos), ' clip num: ', len(self.metas), 'num frames: ', self.num_frames)
+        print('\n')
 
     def prepare_metas(self):
         # read object information
         with open(os.path.join(str(self.img_folder), 'meta.json'), 'r') as f:
             subset_metas_by_video = json.load(f)['videos']
-        
+
         # read expression data
         with open(str(self.ann_file), 'r') as f:
             subset_expressions_by_video = json.load(f)['videos']
-        self.videos = list(subset_expressions_by_video.keys())
+        self.videos = list(sorted(subset_expressions_by_video.keys()))
 
         self.metas = []
         for vid in self.videos:
@@ -81,18 +80,18 @@ class YTVOSDataset(Dataset):
         cols = np.any(img, axis=0)
         rmin, rmax = np.where(rows)[0][[0, -1]]
         cmin, cmax = np.where(cols)[0][[0, -1]]
-        return rmin, rmax, cmin, cmax # y1, y2, x1, x2 
-        
+        return rmin, rmax, cmin, cmax  # y1, y2, x1, x2
+
     def __len__(self):
         return len(self.metas)
-        
+
     def __getitem__(self, idx):
         instance_check = False
         while not instance_check:
             meta = self.metas[idx]  # dict
 
             video, exp, obj_id, category, frames, frame_id = \
-                        meta['video'], meta['exp'], meta['obj_id'], meta['category'], meta['frames'], meta['frame_id']
+                meta['video'], meta['exp'], meta['obj_id'], meta['category'], meta['frames'], meta['frame_id']
             # clean up the caption
             exp = " ".join(exp.lower().split())
             category_id = category_dict[category]
@@ -107,7 +106,7 @@ class YTVOSDataset(Dataset):
                 sample_id_after = random.randint(1, 3)
                 local_indx = [max(0, frame_id - sample_id_before), min(vid_len - 1, frame_id + sample_id_after)]
                 sample_indx.extend(local_indx)
-    
+
                 # global sampling
                 if num_frames > 3:
                     all_inds = list(range(vid_len))
@@ -117,80 +116,90 @@ class YTVOSDataset(Dataset):
                         select_id = random.sample(range(len(global_inds)), global_n)
                         for s_id in select_id:
                             sample_indx.append(global_inds[s_id])
-                    elif vid_len >=global_n:  # sample long range global frames
+                    elif vid_len >= global_n:  # sample long range global frames
                         select_id = random.sample(range(vid_len), global_n)
                         for s_id in select_id:
                             sample_indx.append(all_inds[s_id])
                     else:
-                        select_id = random.sample(range(vid_len), global_n - vid_len) + list(range(vid_len))           
-                        for s_id in select_id:                                                                   
+                        select_id = random.sample(range(vid_len), global_n - vid_len) + list(range(vid_len))
+                        for s_id in select_id:
                             sample_indx.append(all_inds[s_id])
             sample_indx.sort()
 
             # read frames and masks
-            imgs, labels, boxes, masks, valid = [], [], [], [], []
+            imgs, flows, labels, boxes, masks, valid = [], [], [], [], [], []
             for j in range(self.num_frames):
                 frame_indx = sample_indx[j]
                 frame_name = frames[frame_indx]
                 img_path = os.path.join(str(self.img_folder), 'JPEGImages', video, frame_name + '.jpg')
+                flow_path = os.path.join(str(self.img_folder), 'JPEGDepth', video, frame_name + '.png')
                 mask_path = os.path.join(str(self.img_folder), 'Annotations', video, frame_name + '.png')
                 img = Image.open(img_path).convert('RGB')
+                flow = Image.open(flow_path).convert('RGB')
                 mask = Image.open(mask_path).convert('P')
 
                 # create the target
-                label =  torch.tensor(category_id) 
+                label = torch.tensor(category_id)
                 mask = np.array(mask)
-                mask = (mask==obj_id).astype(np.float32) # 0,1 binary
+                mask = (mask == obj_id).astype(np.float32)  # 0,1 binary
                 if (mask > 0).any():
                     y1, y2, x1, x2 = self.bounding_box(mask)
                     box = torch.tensor([x1, y1, x2, y2]).to(torch.float)
                     valid.append(1)
-                else: # some frame didn't contain the instance
-                    box = torch.tensor([0, 0, 0, 0]).to(torch.float) 
+                else:  # some frame didn't contain the instance
+                    box = torch.tensor([0, 0, 0, 0]).to(torch.float)
                     valid.append(0)
                 mask = torch.from_numpy(mask)
 
                 # append
                 imgs.append(img)
+                flows.append(flow)
                 labels.append(label)
                 masks.append(mask)
                 boxes.append(box)
 
             # transform
             w, h = img.size
-            labels = torch.stack(labels, dim=0) 
-            boxes = torch.stack(boxes, dim=0) 
+            labels = torch.stack(labels, dim=0)
+            boxes = torch.stack(boxes, dim=0)
             boxes[:, 0::2].clamp_(min=0, max=w)
             boxes[:, 1::2].clamp_(min=0, max=h)
-            masks = torch.stack(masks, dim=0) 
+            masks = torch.stack(masks, dim=0)
             target = {
-                'frames_idx': torch.tensor(sample_indx), # [T,]
-                'labels': labels,                        # [T,]
-                'boxes': boxes,                          # [T, 4], xyxy
-                'masks': masks,                          # [T, H, W]
-                'valid': torch.tensor(valid),            # [T,]
+                'frames_idx': torch.tensor(sample_indx),  # [T,]
+                'labels': labels,  # [T,]
+                'boxes': boxes,  # [T, 4], xyxy
+                'masks': masks,  # [T, H, W]
+                'valid': torch.tensor(valid),  # [T,]
                 'caption': exp,
-                'orig_size': torch.as_tensor([int(h), int(w)]), 
+                'orig_size': torch.as_tensor([int(h), int(w)]),
                 'size': torch.as_tensor([int(h), int(w)])
             }
 
             # "boxes" normalize to [0, 1] and transform from xyxy to cxcywh in self._transform
-            imgs, target = self._transforms(imgs, target) 
-            imgs = torch.stack(imgs, dim=0) # [T, 3, H, W]
-            
+            imgs, flows, target = self._transforms(imgs, flows, target)
+            imgs = torch.stack(imgs, dim=0)  # [T, 3, H, W]
+            flows = torch.stack(flows, dim=0)
+
             # FIXME: handle "valid", since some box may be removed due to random crop
             if torch.any(target['valid'] == 1):  # at leatst one instance
                 instance_check = True
             else:
                 idx = random.randint(0, self.__len__() - 1)
-
-        return imgs, target
+            # for i, (img, flow) in enumerate(zip(imgs, flows)):
+            #     import matplotlib.pyplot as plt
+            #     img = img.permute(1, 2, 0).numpy().astype(np.uint8)
+            #     plt.imsave(os.path.join('/Users/zyaire/Documents/tmp', f'img_{i}.png'), img)
+            #
+            #     flow = np.clip(0, 1, flow.permute(1, 2, 0).numpy())
+            #     plt.imsave(os.path.join('/Users/zyaire/Documents/tmp', f'flow_{i}.png'), flow)
+        return imgs, flows, target
 
 
 def make_coco_transforms(image_set, max_size=640):
     normalize = T.Compose([
         T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225], [0.5251, 0.2510, 0.2593], [0.3315, 0.2470, 0.1308])
     ])
 
     scales = [288, 320, 352, 392, 416, 448, 480, 512]
@@ -213,7 +222,7 @@ def make_coco_transforms(image_set, max_size=640):
             ),
             normalize,
         ])
-    
+
     # we do not use the 'val' set since the annotations are inaccessible
     if image_set == 'val':
         return T.Compose([
@@ -229,10 +238,30 @@ def build(image_set, args):
     assert root.exists(), f'provided YTVOS path {root} does not exist'
     PATHS = {
         "train": (root / "train", root / "meta_expressions" / "train" / "meta_expressions.json"),
-        "val": (root / "valid", root / "meta_expressions" / "val" / "meta_expressions.json"),    # not used actually
+        "val": (root / "valid", root / "meta_expressions" / "val" / "meta_expressions.json"),  # not used actually
     }
     img_folder, ann_file = PATHS[image_set]
-    dataset = YTVOSDataset(img_folder, ann_file, transforms=make_coco_transforms(image_set, max_size=args.max_size), return_masks=args.masks, 
+    dataset = YTVOSDataset(img_folder, ann_file, transforms=make_coco_transforms(image_set, max_size=args.max_size),
+                           return_masks=args.masks,
                            num_frames=args.num_frames, max_skip=args.max_skip)
     return dataset
 
+
+if __name__ == '__main__':
+    from opts import get_args_parser
+
+    args = get_args_parser().parse_args()
+    args.__setattr__('ytvos_path', '/Volumes/datasets/ref-ytvos')
+
+    mean = torch.zeros(3)
+    std = torch.zeros(3)
+    n_samples = 0
+
+    dataset = build('train', args)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+    for i, (img, flow, target) in enumerate(dataloader):
+        batch_samples = flow.size(0)
+        images = flow.view(batch_samples, flow.size(1), -1)
+        mean += images.mean(2).sum(0)
+        std += images.std(2).sum(0)
+        n_samples += batch_samples

@@ -1,19 +1,17 @@
 """
 Ref-Davis17 data loader
 """
+import json
+import os
+import random
 from pathlib import Path
 
-import torch
-from torch.autograd.grad_mode import F
-from torch.utils.data import Dataset
-import datasets.transforms_video as T
-import os
-from PIL import Image
-
-import json
 import numpy as np
-import random
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
 
+import datasets.transforms_video as T
 from datasets.categories import davis_category_dict as category_dict
 
 

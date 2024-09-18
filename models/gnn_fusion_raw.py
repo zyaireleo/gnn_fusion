@@ -137,7 +137,7 @@ def init_edge(img_per_batch: int, num_batches: int, device: str) -> tuple[Tensor
 class MultimodalGNN(nn.Module):
     def __init__(self, input_dim, num_relations, num_head, **kwargs):
         super().__init__(**kwargs)
-        self.num_relations=num_relations
+        self.num_relations = num_relations
         self.rgcn1 = CusRGCNConv(input_dim, input_dim * 2, num_relations, head=num_head)
         self.rgcn2 = CusRGCNConv(input_dim * 2, input_dim, num_relations, head=num_head)
         self.in_channels = input_dim
@@ -189,28 +189,48 @@ class MultimodalGNN(nn.Module):
         bs, frames, c, h, w = vision_feat.shape
         text_word_feats, text_word_poses = self.reshape_text_feat_and_pos((text_word_features, text_pos), (h, w),
                                                                           device)
-        x_feat = [torch.cat((vision_feat[i], motion_feat[i],
-                             rearrange(text_word_feats[i], '(t c) h w->t c h w', t=1)), dim=0) for i in range(bs)]
-        x_feat = rearrange(torch.stack(x_feat, dim=0).to(device), 'b n c h w -> (b n) c (h w)')
-        x_pos = [torch.cat((vision_pos[i], motion_pos[i],
-                            rearrange(text_word_poses[i], '(t c) h w->t c h w', t=1)), dim=0) for i in range(bs)]
-        x_pos = rearrange(torch.stack(x_pos, dim=0).to(device), 'b n c h w -> (b n) c (h w)')
+        x_feat = []
+        for i in range(bs):
+            x_feat_i = torch.cat((vision_feat[i], motion_feat[i],
+                                  rearrange(text_word_feats[i], '(t c) h w->t c h w', t=1)), dim=0)
+            x_feat_i = rearrange(x_feat_i, ' n c h w ->n c (h w)')
+            x_pos_i = torch.cat([vision_feat[i], motion_feat[i],
+                                 rearrange(text_word_feats[i], '(t c) h w->t c h w', t=1)], dim=0)
+            x_pos_i = rearrange(x_pos_i, ' n c h w ->n c (h w)')
+
+            global_x = torch.mean(x_feat_i + x_pos_i, dim=0, keepdim=True)
+            x_feat_i = torch.cat([x_feat_i + x_pos_i, global_x], dim=0)
+            x_feat.append(x_feat_i)
+
+        x_feat = rearrange(torch.stack(x_feat, dim=0).to(device), 'b n c f -> (b n) c f')
+
+        # x_feat = [torch.cat((vision_feat[i], motion_feat[i],
+        #                      rearrange(text_word_feats[i], '(t c) h w->t c h w', t=1)), dim=0) for i in range(bs)]
+        # x_feat = rearrange(torch.stack(x_feat, dim=0).to(device), 'b n c h w -> (b n) c (h w)')
+        # x_pos = [torch.cat((vision_pos[i], motion_pos[i],
+        #                     rearrange(text_word_poses[i], '(t c) h w->t c h w', t=1)), dim=0) for i in range(bs)]
+        # x_pos = rearrange(torch.stack(x_pos, dim=0).to(device), 'b n c h w -> (b n) c (h w)')
 
         edge_index, edge_type = init_edge(frames, bs, device)
-        x_feat = x_feat + x_pos
+        # x_feat = x_feat + x_pos
 
         x_feat = self.rgcn1(x_feat, edge_index, edge_type)
         x_feat = self.rgcn2(x_feat, edge_index, edge_type)
 
         x_feat = rearrange(x_feat, 't c (h w) -> t c h w', h=h)
-        vision, motion = [], []
+        vision, motion, global_x = [], [], []
         for i in range(bs):
             start_index = i * 2 * frames + i
             vision_end_index = start_index + frames
+            motion_end_index = vision_end_index + frames
+            global_x_index = motion_end_index + 2
             vision.append(x_feat[start_index:vision_end_index])
             motion.append(x_feat[vision_end_index:vision_end_index + frames])
+            global_x_i = x_feat[global_x_index]
+            global_x.append(global_x_i)
         vision = torch.stack(vision, dim=0).to(device)
         motion = torch.stack(motion, dim=0).to(device)
+        text_f = torch.stack(global_x, dim=0).to(device)
 
         feat = rearrange(vision_feat + self.dropout(vision), 'b t c h w -> (b t) c h w')
 
@@ -219,7 +239,7 @@ class MultimodalGNN(nn.Module):
         #         self.relu(
         #             self.norm(
         #                 self.conv(rearrange(vision + vision_feat, 'b t c h w -> (b t) c h w'))))))  # (bs*t,c,h,w)
-        return feat, None
+        return feat, text_f
 
 
 if __name__ == '__main__':
@@ -227,7 +247,7 @@ if __name__ == '__main__':
     height, width = 6, 8
     img_per_batch = 5
     batch = 2
-    model = MultimodalGNN(256, 6, 4)
+    model = MultimodalGNN(256, 7, 4)
     (vision_feat, vision_pos) = (
         torch.rand(batch, img_per_batch, 256, height, width), torch.rand(batch, img_per_batch, 256, height, width))
     (motion_feat, motion_pos) = (
@@ -236,3 +256,19 @@ if __name__ == '__main__':
 
     out = model(((vision_feat, vision_pos), (motion_feat, motion_pos), (text_feat, text_pos)))
     print(out[0].shape)
+    print(out[1].shape)
+    t = out[1].unsqueeze(0).expand(4, -1, -1, -1, -1)
+    # x 的形状: (l, b, c, h, w)
+    print(t.shape)
+
+    # Step 1: 先将 x 的形状从 (l, b, c, h, w) 转换为 (b, l, c, h, w)
+    x = t.permute(1, 0, 2, 3, 4)  # 形状变为 (b, l, c, h, w)
+    print(x.shape)
+    b, l, c, h, w = x.shape
+    x = x.view(b, l, c, h * w)
+    print(x.shape)
+
+    # Step 2: 展开 l 维度，并在 h, w 维度上进行 cat 操作
+    # 在 h 维度上拼接所有层的特征
+    x_cat = torch.cat([x[:, i, :, :] for i in range(l)], dim=-1)  # 在最后一个维度拼接，dim=-1
+    print(x_cat.shape)

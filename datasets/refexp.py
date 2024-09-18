@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 import torch.utils.data
 import torchvision
+from PIL import Image
 from pycocotools import mask as coco_mask
 
 import datasets.transforms_image as T
@@ -18,6 +19,7 @@ class ModulatedDetection(torchvision.datasets.CocoDetection):
     def __init__(self, img_folder, ann_file, transforms, return_masks):
         super(ModulatedDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
+        self.img_folder = img_folder
         self.prepare = ConvertCocoPolysToMask(return_masks)
 
     def __getitem__(self, idx):
@@ -28,14 +30,20 @@ class ModulatedDetection(torchvision.datasets.CocoDetection):
             coco_img = self.coco.loadImgs(image_id)[0]
             caption = coco_img["caption"]
             dataset_name = coco_img["dataset_name"] if "dataset_name" in coco_img else None
+
+            # 获取光流图像
+            flow_path = (Path(self.img_folder.parent / 'depth' / self.img_folder.name)
+                         / f"{coco_img['file_name'].replace('.jpg', '.png')}")
+            flow = Image.open(flow_path).convert("RGB")
+
             target = {"image_id": image_id, "annotations": target, "caption": caption}
             img, target = self.prepare(img, target)
             if self._transforms is not None:
-                img, target = self._transforms(img, target)
+                img, flow, target = self._transforms(img, flow, target)
             target["dataset_name"] = dataset_name
             for extra_key in ["sentence_id", "original_img_id", "original_id", "task_id"]:
                 if extra_key in coco_img:
-                    target[extra_key] = coco_img[extra_key] # box xyxy -> cxcywh
+                    target[extra_key] = coco_img[extra_key]  # box xyxy -> cxcywh
             # FIXME: handle "valid", since some box may be removed due to random crop
             target["valid"] = torch.tensor([1]) if len(target["area"]) != 0 else torch.tensor([0])
 
@@ -44,7 +52,7 @@ class ModulatedDetection(torchvision.datasets.CocoDetection):
             else:
                 import random
                 idx = random.randint(0, self.__len__() - 1)
-        return img.unsqueeze(0), target
+        return img.unsqueeze(0), flow.unsqueeze(0), target
         # return img: [1, 3, H, W], the first dimension means T = 1.
 
 
@@ -83,7 +91,7 @@ class ConvertCocoPolysToMask(object):
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
-        boxes[:, 2:] += boxes[:, :2] # xminyminwh -> xyxy
+        boxes[:, 2:] += boxes[:, :2]  # xminyminwh -> xyxy
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
@@ -122,11 +130,11 @@ class ConvertCocoPolysToMask(object):
 
 
 def make_coco_transforms(image_set, cautious):
-
-    normalize = T.Compose([T.ToTensor(), T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+    normalize = T.Compose([T.ToTensor(), T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225],
+                                                     [0.523, 0.254, 0.248], [0.341, 0.249, 0.133])])
 
     scales = [480, 512, 544, 576, 608, 640, 672, 704, 736, 768]
-    final_scales = [296, 328, 360, 392, 416, 448, 480, 512] 
+    final_scales = [296, 328, 360, 392, 416, 448, 480, 512]
 
     max_size = 800
     if image_set == "train":
@@ -177,3 +185,20 @@ def build(dataset_file, image_set, args):
         return_masks=args.masks,
     )
     return dataset
+
+
+if __name__ == '__main__':
+    from opts import get_args_parser
+
+    args = get_args_parser().parse_args()
+    mean = torch.zeros(3)
+    std = torch.zeros(3)
+    n_samples = 0
+    dataset = build('refcoco', 'train', args)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+    for i, (img, flow, target) in enumerate(dataloader):
+        batch_samples = flow.size(0)
+        images = flow.view(batch_samples, flow.size(1), -1)
+        mean += images.mean(2).sum(0)
+        std += images.std(2).sum(0)
+        n_samples += batch_samples

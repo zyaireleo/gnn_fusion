@@ -2,6 +2,7 @@
 Segmentaion Part 
 Modified from DETR (https://github.com/facebookresearch/detr)
 """
+import copy
 from collections import defaultdict
 from typing import List, Optional
 
@@ -24,7 +25,8 @@ from .position_encoding import PositionEmbeddingSine1D
 
 BN_MOMENTUM = 0.1
 
-def get_norm(norm, out_channels): # only support GN or LN
+
+def get_norm(norm, out_channels):  # only support GN or LN
     """
     Args:
         norm (str or callable): either one of BN, SyncBN, FrozenBN, GN;
@@ -44,6 +46,7 @@ def get_norm(norm, out_channels): # only support GN or LN
             "LN": lambda channels: nn.LayerNorm(channels)
         }[norm]
     return norm(out_channels)
+
 
 class Conv2d(torch.nn.Conv2d):
     """
@@ -90,6 +93,7 @@ class Conv2d(torch.nn.Conv2d):
             x = self.activation(x)
         return x
 
+
 # FPN structure
 class CrossModalFPNDecoder(nn.Module):
     def __init__(self, feature_channels: List, conv_dim: int, mask_dim: int, dim_feedforward: int = 2048, norm=None):
@@ -115,8 +119,8 @@ class CrossModalFPNDecoder(nn.Module):
             output_norm = get_norm(norm, conv_dim)
 
             lateral_conv = Conv2d(
-                    in_channels, conv_dim, kernel_size=1, bias=use_bias, norm=lateral_norm
-                )
+                in_channels, conv_dim, kernel_size=1, bias=use_bias, norm=lateral_norm
+            )
             output_conv = Conv2d(
                 conv_dim,
                 conv_dim,
@@ -129,13 +133,13 @@ class CrossModalFPNDecoder(nn.Module):
             )
             weight_init.c2_xavier_fill(lateral_conv)
             weight_init.c2_xavier_fill(output_conv)
-            stage = idx+1
+            stage = idx + 1
             self.add_module("adapter_{}".format(stage), lateral_conv)
             self.add_module("layer_{}".format(stage), output_conv)
 
             lateral_convs.append(lateral_conv)
             output_convs.append(output_conv)
-            
+
         # Place convs into top-down order (from low to high resolution)
         # to make the top-down computation in forward clearer.
         self.lateral_convs = lateral_convs[::-1]
@@ -155,7 +159,7 @@ class CrossModalFPNDecoder(nn.Module):
         self.text_pos = PositionEmbeddingSine1D(conv_dim, normalize=True)
         sr_ratios = [8, 4, 2, 1]
         cross_attns = []
-        for idx in range(len(feature_channels)): # res2 -> res5
+        for idx in range(len(feature_channels)):  # res2 -> res5
             cross_attn = VisionLanguageBlock(conv_dim, dim_feedforward=dim_feedforward,
                                              nhead=8, sr_ratio=sr_ratios[idx])
             for p in cross_attn.parameters():
@@ -167,18 +171,17 @@ class CrossModalFPNDecoder(nn.Module):
         # place cross-attn in top-down order (from low to high resolution)
         self.cross_attns = cross_attns[::-1]
 
-
     def forward_features(self, features, text_features, poses, memory, nf):
         # nf: num_frames
-        text_pos = self.text_pos(text_features).permute(2, 0, 1)   # [length, batch_size, c]  
-        text_features, text_masks = text_features.decompose()      
-        text_features = text_features.permute(1, 0, 2)   
+        text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
+        text_features, text_masks = text_features.decompose()
+        text_features = text_features.permute(1, 0, 2)
 
-        for idx, (mem, f, pos) in enumerate(zip(memory[::-1], features[1:][::-1], poses[1:][::-1])): # 32x -> 8x
+        for idx, (mem, f, pos) in enumerate(zip(memory[::-1], features[1:][::-1], poses[1:][::-1])):  # 32x -> 8x
             lateral_conv = self.lateral_convs[idx]
             output_conv = self.output_convs[idx]
             cross_attn = self.cross_attns[idx]
-            
+
             _, x_mask = f.decompose()
             n, c, h, w = pos.shape
             b = n // nf
@@ -197,22 +200,22 @@ class CrossModalFPNDecoder(nn.Module):
                                  memory_key_padding_mask=text_masks,
                                  pos=text_pos,
                                  query_pos=vision_pos
-            ) # [t*h*w, b, c]
+                                 )  # [t*h*w, b, c]
             cur_fpn = rearrange(cur_fpn, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
 
             # upsample
-            if idx == 0: # top layer
+            if idx == 0:  # top layer
                 y = output_conv(cur_fpn)
             else:
                 # Following FPN implementation, we use nearest upsampling here
                 y = cur_fpn + F.interpolate(y, size=cur_fpn.shape[-2:], mode="nearest")
                 y = output_conv(y)
-        
+
         # 4x level
         lateral_conv = self.lateral_convs[-1]
         output_conv = self.output_convs[-1]
         cross_attn = self.cross_attns[-1]
-        
+
         x, x_mask = features[0].decompose()
         pos = poses[0]
         n, c, h, w = pos.shape
@@ -231,12 +234,12 @@ class CrossModalFPNDecoder(nn.Module):
                              memory_key_padding_mask=text_masks,
                              pos=text_pos,
                              query_pos=vision_pos
-        ) # [t*h*w, b, c]
+                             )  # [t*h*w, b, c]
         cur_fpn = rearrange(cur_fpn, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
         # Following FPN implementation, we use nearest upsampling here
         y = cur_fpn + F.interpolate(y, size=cur_fpn.shape[-2:], mode="nearest")
         y = output_conv(y)
-        return y   # [b*t, c, h, w], the spatial stride is 4x
+        return y  # [b*t, c, h, w], the spatial stride is 4x
 
     def forward(self, features, text_features, pos, memory, nf):
         """The forward function receives the vision and language features, 
@@ -294,13 +297,13 @@ class VisionLanguageBlock(nn.Module):
         b = tgt.size(1)
         # self attn
         q = k = self.with_pos_embed(tgt, query_pos)
-        if self.sr_ratio > 1: # downsample
+        if self.sr_ratio > 1:  # downsample
             q = rearrange(q, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             k = rearrange(k, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             v = rearrange(tgt, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             # downsample
-            new_h = int(h * 1./self.sr_ratio)
-            new_w = int(w * 1./self.sr_ratio)
+            new_h = int(h * 1. / self.sr_ratio)
+            new_w = int(w * 1. / self.sr_ratio)
             size = (new_h, new_w)
             q = F.interpolate(q, size=size, mode='nearest')
             k = F.interpolate(k, size=size, mode='nearest')
@@ -310,17 +313,18 @@ class VisionLanguageBlock(nn.Module):
             k = rearrange(k, '(b t) c h w -> (t h w) b c', t=t)
             v = rearrange(v, '(b t) c h w -> (t h w) b c', t=t)
             # downsample mask
-            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b*t, h, w)
-            tgt_key_padding_mask = F.interpolate(tgt_key_padding_mask[None].float(), size=(new_h, new_w), mode='nearest').bool()[0] 
+            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b * t, h, w)
+            tgt_key_padding_mask = \
+                F.interpolate(tgt_key_padding_mask[None].float(), size=(new_h, new_w), mode='nearest').bool()[0]
             tgt_key_padding_mask = tgt_key_padding_mask.reshape(b, t, new_h, new_w).flatten(1)
         else:
             v = tgt
         tgt2 = self.self_attn(q, k, value=v, attn_mask=None,
-                              key_padding_mask=tgt_key_padding_mask)[0] # [H*W, B*T, C]
+                              key_padding_mask=tgt_key_padding_mask)[0]  # [H*W, B*T, C]
         if self.sr_ratio > 1:
             tgt2 = rearrange(tgt2, '(t h w) b c -> (b t) c h w', t=t, h=new_h, w=new_w)
             size = (h, w)  # recover to origin size
-            tgt2 = F.interpolate(tgt2, size=size, mode='bilinear', align_corners=False) # [B*T, C, H, W]
+            tgt2 = F.interpolate(tgt2, size=size, mode='bilinear', align_corners=False)  # [B*T, C, H, W]
             tgt2 = rearrange(tgt2, '(b t) c h w -> (t h w) b c', t=t)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -348,13 +352,13 @@ class VisionLanguageBlock(nn.Module):
         # self attn
         tgt2 = self.norm1(tgt)
         q = k = self.with_pos_embed(tgt2, query_pos)
-        if self.sr_ratio > 1: # downsample
+        if self.sr_ratio > 1:  # downsample
             q = rearrange(q, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             k = rearrange(k, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             v = rearrange(tgt, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             # downsample
-            new_h = int(h * 1./self.sr_ratio)
-            new_w = int(w * 1./self.sr_ratio)
+            new_h = int(h * 1. / self.sr_ratio)
+            new_w = int(w * 1. / self.sr_ratio)
             size = (new_h, new_w)
             q = F.interpolate(q, size=size, mode='nearest')
             k = F.interpolate(k, size=size, mode='nearest')
@@ -364,17 +368,18 @@ class VisionLanguageBlock(nn.Module):
             k = rearrange(k, '(b t) c h w -> (t h w) b c', t=t)
             v = rearrange(v, '(b t) c h w -> (t h w) b c', t=t)
             # downsample mask
-            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b*t, h, w)
-            tgt_key_padding_mask = F.interpolate(tgt_key_padding_mask[None].float(), size=(new_h, new_w), mode='nearest').bool()[0] 
+            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b * t, h, w)
+            tgt_key_padding_mask = \
+                F.interpolate(tgt_key_padding_mask[None].float(), size=(new_h, new_w), mode='nearest').bool()[0]
             tgt_key_padding_mask = tgt_key_padding_mask.reshape(b, t, new_h, new_w).flatten(1)
         else:
             v = tgt2
         tgt2 = self.self_attn(q, k, value=v, attn_mask=None,
-                              key_padding_mask=tgt_key_padding_mask)[0] # [T*H*W, B, C]
+                              key_padding_mask=tgt_key_padding_mask)[0]  # [T*H*W, B, C]
         if self.sr_ratio > 1:
             tgt2 = rearrange(tgt2, '(t h w) b c -> (b t) c h w', t=t, h=new_h, w=new_w)
             size = (h, w)  # recover to origin size
-            tgt2 = F.interpolate(tgt2, size=size, mode='bilinear', align_corners=False) # [B*T, C, H, W]
+            tgt2 = F.interpolate(tgt2, size=size, mode='bilinear', align_corners=False)  # [B*T, C, H, W]
             tgt2 = rearrange(tgt2, '(b t) c h w -> (t h w) b c', t=t)
         tgt = tgt + self.dropout1(tgt2)
 
@@ -399,12 +404,11 @@ class VisionLanguageBlock(nn.Module):
                 query_pos: Optional[Tensor] = None):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, t, h, w,
-                                    tgt_key_padding_mask, memory_key_padding_mask, 
+                                    tgt_key_padding_mask, memory_key_padding_mask,
                                     pos, query_pos)
         return self.forward_post(tgt, memory, t, h, w,
-                                 tgt_key_padding_mask, memory_key_padding_mask, 
+                                 tgt_key_padding_mask, memory_key_padding_mask,
                                  pos, query_pos)
-
 
 
 class VisionLanguageFusionModule(nn.Module):
@@ -423,7 +427,9 @@ class VisionLanguageFusionModule(nn.Module):
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=None,
                                    key_padding_mask=memory_key_padding_mask)[0]
-        tgt = tgt * tgt2
+        # tgt=visual feature; memory=text_word_features;  pos=text_pos; query pos= None;
+        # memory_key_padding_mask=text_word_masks;
+        tgt = tgt + tgt2
         return tgt
 
 
@@ -484,3 +490,5 @@ def _get_activation_fn(activation):
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
 
 
+def _get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])

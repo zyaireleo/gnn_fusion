@@ -11,7 +11,7 @@ import numpy as np
 from torchvision.ops.boxes import box_area
 
 def compute_bbox_iou(boxes1: torch.Tensor, boxes2: torch.Tensor):
-    # both boxes: xyxy
+    # both boxes: xyxyg
     area1 = box_area(boxes1)
     area2 = box_area(boxes2)
 

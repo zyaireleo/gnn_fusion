@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -x
 
+source activate foundmental
+module load cuda/12.1
+module load gcc
+module list
+
 GPUS=${GPUS:-8}
 PORT=${PORT:-29500}
 if [ $GPUS -lt 8 ]; then
@@ -10,7 +15,7 @@ else
 fi
 CPUS_PER_TASK=${CPUS_PER_TASK:-5}
 
-OUTPUT_DIR=$1
+OUTPUT_DIR=${1:-'./output/ytvos'}
 PY_ARGS=${@:2}  # Any arguments from the forth one are captured by this
 
 
@@ -19,7 +24,7 @@ PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
 python3 -m torch.distributed.launch --nproc_per_node=${GPUS_PER_NODE} --master_port=${PORT} --use_env \
 main_joint.py --with_box_refine --binary --freeze_text_encoder \
 --epochs 12 --lr_drop 8 10 \
---output_dir=${OUTPUT_DIR}  ${PY_ARGS} 
+--backbone resnet50 -output_dir=${OUTPUT_DIR}  ${PY_ARGS}
 # --backbone [backbone]
 
 # inference

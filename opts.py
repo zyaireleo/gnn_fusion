@@ -1,9 +1,10 @@
 import argparse
 
+
 def get_args_parser():
     parser = argparse.ArgumentParser('ReferFormer training and inference scripts.', add_help=False)
     parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_backbone', default=5e-5, type=float)
+    parser.add_argument('--lr_backbone', default=6e-6, type=float)
     parser.add_argument('--lr_backbone_names', default=['backbone.0'], type=str, nargs='+')
     parser.add_argument('--lr_text_encoder', default=1e-5, type=float)
     parser.add_argument('--lr_text_encoder_names', default=['text_encoder'], type=str, nargs='+')
@@ -18,22 +19,24 @@ def get_args_parser():
 
     # Model parameters
     # load the pretrained weights
-    parser.add_argument('--pretrained_weights', type=str, default=None,
-                        help="Path to the pretrained model.") 
+    # parser.add_argument('--pretrained_weights', type=str, default='/Volumes/datasets/r50_pretrain.pth',
+    #                     help="Path to the pretrained model.")
+    parser.add_argument('--pretrained_weights', type=str, help="Path to the pretrained model.")
 
     # Variants of Deformable DETR
     parser.add_argument('--with_box_refine', default=False, action='store_true')
-    parser.add_argument('--two_stage', default=False, action='store_true') # NOTE: must be false
+    parser.add_argument('--two_stage', default=False, action='store_true')  # NOTE: must be false
 
     # * Backbone
     # ["resnet50", "resnet101", "swin_t_p4w7", "swin_s_p4w7", "swin_b_p4w7", "swin_l_p4w7"]
     # ["video_swin_t_p4w7", "video_swin_s_p4w7", "video_swin_b_p4w7"]
-    parser.add_argument('--backbone', default='resnet50', type=str, 
+    parser.add_argument('--vision_backbone', default='swin_t_p4w7', type=str,
                         help="Name of the convolutional backbone to use")
-    parser.add_argument('--backbone_pretrained', default=None, type=str, 
+    parser.add_argument('--backbone_pretrained', default=None, type=str,
                         help="if use swin backbone and train from scratch, the path to the pretrained weights")
-    parser.add_argument('--use_checkpoint', action='store_true', help='whether use checkpoint for swin/video swin backbone')
-    parser.add_argument('--dilation', action='store_true', # DC5
+    parser.add_argument('--use_checkpoint', action='store_true',
+                        help='whether use checkpoint for swin/video swin backbone')
+    parser.add_argument('--dilation', action='store_true',  # DC5
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
@@ -46,7 +49,7 @@ def get_args_parser():
                         help="Number of decoding layers in the transformer")
     parser.add_argument('--dim_feedforward', default=2048, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
-    parser.add_argument('--hidden_dim', default=256, type=int, 
+    parser.add_argument('--hidden_dim', default=256, type=int,
                         help="Size of the embeddings (dimension of the transformer)")
     parser.add_argument('--dropout', default=0.1, type=float,
                         help="Dropout applied in the transformer")
@@ -55,25 +58,25 @@ def get_args_parser():
     parser.add_argument('--num_frames', default=5, type=int,
                         help="Number of clip frames for training")
     parser.add_argument('--num_queries', default=5, type=int,
-                        help="Number of query slots, all frames share the same queries") 
+                        help="Number of query slots, all frames share the same queries")
     parser.add_argument('--dec_n_points', default=4, type=int)
     parser.add_argument('--enc_n_points', default=4, type=int)
     parser.add_argument('--pre_norm', action='store_true')
     # for text
-    parser.add_argument('--freeze_text_encoder', action='store_true') # default: False
+    parser.add_argument('--freeze_text_encoder', action='store_true')  # default: False
 
     # * Segmentation
     parser.add_argument('--masks', action='store_true',
                         help="Train segmentation head if the flag is provided")
-    parser.add_argument('--mask_dim', default=256, type=int, 
+    parser.add_argument('--mask_dim', default=256, type=int,
                         help="Size of the mask embeddings (dimension of the dynamic mask conv)")
-    parser.add_argument('--controller_layers', default=3, type=int, 
+    parser.add_argument('--controller_layers', default=3, type=int,
                         help="Dynamic conv layer number")
-    parser.add_argument('--dynamic_mask_channels', default=8, type=int, 
+    parser.add_argument('--dynamic_mask_channels', default=8, type=int,
                         help="Dynamic conv final channel number")
     parser.add_argument('--no_rel_coord', dest='rel_coord', action='store_false',
                         help="Disables relative coordinates")
-    
+
     # Loss
     parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false',
                         help="Disables auxiliary decoding losses (loss at each layer)")
@@ -101,18 +104,19 @@ def get_args_parser():
     # dataset parameters
     # ['ytvos', 'davis', 'a2d', 'jhmdb', 'refcoco', 'refcoco+', 'refcocog', 'all']
     # 'all': using the three ref datasets for pretraining
-    parser.add_argument('--dataset_file', default='ytvos', help='Dataset name') 
+    parser.add_argument('--dataset_file', default='ytvos', help='Dataset name')
     parser.add_argument('--coco_path', type=str, default='data/coco')
-    parser.add_argument('--ytvos_path', type=str, default='data/ref-youtube-vos')
-    parser.add_argument('--davis_path', type=str, default='data/ref-davis')
-    parser.add_argument('--a2d_path', type=str, default='data/a2d_sentences')
-    parser.add_argument('--jhmdb_path', type=str, default='data/jhmdb_sentences')
+    # parser.add_argument('--ytvos_path', type=str, default='/Volumes/datasets/ref-ytvos')
+    parser.add_argument('--ytvos_path', type=str, default='/public/home/lfzh/LYF/ReferFormer/data/ref-youtube-vos')
+    parser.add_argument('--davis_path', type=str, default='/public/home/lfzh/LYF/ReferFormer/data/ref-davis')
+    parser.add_argument('--a2d_path', type=str, default='/public/home/lfzh/LYF/ReferFormer/data/a2d_sentences/')
+    parser.add_argument('--jhmdb_path', type=str, default='/public/home/lfzh/LYF/ReferFormer/data/jhmdb_sentences')
     parser.add_argument('--max_skip', default=3, type=int, help="max skip frame number")
     parser.add_argument('--max_size', default=640, type=int, help="max size for the frame")
     parser.add_argument('--binary', action='store_true')
     parser.add_argument('--remove_difficult', action='store_true')
 
-    parser.add_argument('--output_dir', default='output',
+    parser.add_argument('--output_dir', default='output/ref-ytvos',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -124,8 +128,8 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=4, type=int)
 
     # test setting
-    parser.add_argument('--threshold', default=0.5, type=float) # binary threshold for mask
-    parser.add_argument('--ngpu', default=8, type=int, help='gpu number when inference for ref-ytvos and ref-davis')
+    parser.add_argument('--threshold', default=0.5, type=float)  # binary threshold for mask
+    parser.add_argument('--ngpu', default=4, type=int, help='gpu number when inference for ref-ytvos and ref-davis')
     parser.add_argument('--split', default='valid', type=str, choices=['valid', 'test'])
     parser.add_argument('--visualize', action='store_true', help='whether visualize the masks during inference')
 
@@ -133,7 +137,5 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
+    parser.add_argument('--cache_mode', default=True, action='store_true', help='whether to cache images on memory')
     return parser
-
-
